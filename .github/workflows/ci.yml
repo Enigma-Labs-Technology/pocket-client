@@ -1,0 +1,92 @@
+name: CI
+
+# The package declares `swift-tools-version: 6.0` and targets iOS 17+ / macOS 14+.
+# Two gates, both cheap and both hermetic: the unit suite (no hardware, no
+# network) and an iOS compile check. Nothing here touches a radio.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded PR pushes are cancelled; runs on main and on tags are not, so a
+  # cancelled run can never be what the status badge reports.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: swift test (macOS)
+    # Pinned, not `macos-latest`. The toolchain this package is built with moves
+    # when this line moves, not when GitHub rotates a label. macos-15 is the
+    # oldest current image whose default Xcode already ships Swift 6, which is
+    # the floor `swift-tools-version: 6.0` sets.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          # A workflow that silently runs an older toolchain than the package
+          # requires is worse than no workflow: it reports green for a build
+          # nobody asked for. Assert the floor rather than assume the image.
+          version="$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+\.[0-9]+).*/\1/p' | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not determine the Swift version from \`swift --version\`."
+            exit 1
+          fi
+          if [ "${version%%.*}" -lt 6 ]; then
+            echo "::error::This package requires a Swift 6 toolchain (swift-tools-version: 6.0); this runner has $version."
+            exit 1
+          fi
+          echo "Swift $version — meets the Swift 6 floor."
+
+      # The suite replays captured transcripts against a fake transport. It needs
+      # no device, no network and no simulator runtime. `DEVELOPER_DIR` is left at
+      # the image default, which is a full Xcode — the command-line-tools
+      # toolchain cannot run the test target.
+      - name: swift test
+        run: swift test
+
+  ios-build:
+    name: iOS build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          version="$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+\.[0-9]+).*/\1/p' | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not determine the Swift version from \`swift --version\`."
+            exit 1
+          fi
+          if [ "${version%%.*}" -lt 6 ]; then
+            echo "::error::This package requires a Swift 6 toolchain (swift-tools-version: 6.0); this runner has $version."
+            exit 1
+          fi
+          echo "Swift $version — meets the Swift 6 floor."
+
+      # A generic simulator destination: it compiles the iOS slice without code
+      # signing, without a provisioning profile, and without downloading a
+      # simulator runtime. This is a compile check, not a test run — the iOS-only
+      # code paths (state restoration, the programmatic hotspot join) have never
+      # executed on a phone, and building them here does not change that.
+      - name: xcodebuild
+        run: |
+          xcodebuild \
+            -scheme PocketClient \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            build

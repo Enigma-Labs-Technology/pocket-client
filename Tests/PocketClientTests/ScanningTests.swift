@@ -7,12 +7,17 @@
 // tests drive that core directly, with time injected, so no radio is needed.
 //
 // The CoreBluetooth shell around it (central construction, delegate feed,
-// scan start/stop on subscriber count, the prune timer) is deliberately NOT
-// tested here: CoreBluetooth cannot be faked (standing decision — no mock CB
-// layer), and constructing a real central would touch the radio stack and
-// its permission prompt. The shell is compile-verified only; the hardware
-// harness (`pocket-cli scan`) proves it live. Likewise `connect(to:)` — its
-// retrieve-and-connect path shares BLETransport's untestable delegate chain.
+// scan start/stop on subscriber count, the prune timer) is NOT tested here:
+// `PocketScanner` still owns a `CBCentralManager` directly, and constructing
+// a real one would touch the radio stack and its permission prompt. The shell
+// is compile-verified only; the hardware harness (`pocket-cli scan`) proves it
+// live.
+//
+// That is now a gap rather than a law. `BLETransport` was given a seam
+// (`BLECentral`/`BLEPeripheral`) and is driven end to end by a fake radio in
+// BLETransportTests — including `connect(to:)`, whose retrieve-and-connect
+// path this file used to describe as sharing an untestable delegate chain.
+// The same seam would fit this shell; nobody has done it yet.
 //
 // (Mutating calls are bound to locals before `#expect` — the macro's
 // captured receiver is immutable.)

@@ -8,7 +8,10 @@ import Foundation
 /// command/response/bulk channels in `PocketGATT`. Service and characteristic
 /// discovery always pass explicit UUID lists, never `nil` wildcards, so the
 /// device's OTA/rebinding services are never even enumerated (see the safety
-/// note on `PocketGATT`).
+/// note on `PocketGATT`). That is now enforced by the type system as well as
+/// by discipline: discovery goes through `BLEPeripheral.discoverServices(only:)`,
+/// whose list is non-optional, so the wildcard is unrepresentable here — and
+/// `BLEDiscoveryTests` pins the exact lists on top of that.
 ///
 /// Threading: every mutable property is confined to `queue`, the serial
 /// dispatch queue the central manager delivers its delegate callbacks on.
@@ -29,22 +32,25 @@ import Foundation
 /// "Background execution (iOS)"). macOS has no state restoration; the
 /// identifier is ignored there and this type behaves exactly as before.
 ///
-/// No automated coverage of the radio paths by design; Task 9 validates
-/// against real hardware, and only the pure restoration policy
-/// (`BLERestoration`) is unit-tested.
+/// Testability: the radio is reached only through the `BLECentral` /
+/// `BLEPeripheral` seam (see `BLESeam.swift`), so the whole state machine —
+/// connect, discovery, teardown, cancellation, the attempt tokens, state
+/// restoration — runs against a fake radio in `swift test` with no device
+/// present. Hardware validates the parts a fake cannot: real timing, the
+/// device's actual GATT table, and whether the recorder answers at all.
 public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable {
     /// IUO only because `self` must already be the delegate when the central
     /// is constructed (state restoration delivers `willRestoreState` as the
     /// very first callback; a delegate attached even one statement later is a
     /// race against it). Assigned exactly once in `init`, never nil after.
-    private var central: CBCentralManager!
+    private var central: (any BLECentral)!
     private let queue = DispatchQueue(label: "pocket.ble")
     private let namePrefix: String
 
     // MARK: Queue-confined state
 
-    private var peripheral: CBPeripheral?
-    private var commandCharacteristic: CBCharacteristic?
+    private var peripheral: (any BLEPeripheral)?
+    private var commandCharacteristic: (any BLECharacteristic)?
     private var connectContinuation: CheckedContinuation<DiscoveredDevice, Error>?
     private var poweredOnContinuation: CheckedContinuation<Void, Error>?
     /// FIFO of senders awaiting their GATT write ack; CoreBluetooth delivers
@@ -83,7 +89,7 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
     /// Restored peripherals that were NOT adopted: retained until poweredOn so
     /// their stale links can be cancelled, then forgotten. Their disconnect
     /// callbacks are bookkeeping, not a teardown of this transport.
-    private var restorationDiscards: [CBPeripheral] = []
+    private var restorationDiscards: [any BLEPeripheral] = []
 
     // MARK: Diagnostics state (Task 9 harness — recording only, no BLE traffic)
 
@@ -108,7 +114,18 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
     ///     the same stable string on every launch; nil (the default) opts out
     ///     and constructs exactly the plain central this type always used.
     ///     See README, "Background execution (iOS)".
-    public init(namePrefix: String = "PKT01_", restoreIdentifier: String? = nil) {
+    public convenience init(namePrefix: String = "PKT01_", restoreIdentifier: String? = nil) {
+        self.init(namePrefix: namePrefix, restoreIdentifier: restoreIdentifier,
+                  central: Self.liveCentral)
+    }
+
+    /// The designated initializer, taking the factory that builds the central.
+    /// Internal, and the only reason the public one above is a convenience:
+    /// substituting a fake radio here is what makes every path below reachable
+    /// by a test (see `BLESeam.swift`). Production behavior is unchanged — the
+    /// public initializer passes `liveCentral`, which constructs exactly the
+    /// `CBCentralManager` this type always constructed.
+    init(namePrefix: String, restoreIdentifier: String?, central makeCentral: BLECentralFactory) {
         self.namePrefix = namePrefix
         (responses, responseContinuation) = AsyncStream<Data>.makeStream()
         (bulk, bulkContinuation) = AsyncStream<Data>.makeStream()
@@ -117,8 +134,12 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         // first callback (`willRestoreState`) cannot race a late assignment.
         // Without restoration the ordering is behaviorally identical: every
         // callback no-ops against the empty initial state.
-        central = CBCentralManager(delegate: self, queue: queue,
-                                   options: Self.centralManagerOptions(restoreIdentifier: restoreIdentifier))
+        central = makeCentral(self, queue, Self.centralManagerOptions(restoreIdentifier: restoreIdentifier))
+    }
+
+    /// The one place a real `CBCentralManager` is created.
+    private static let liveCentral: BLECentralFactory = { delegate, queue, options in
+        CBCentralManager(delegate: delegate, queue: queue, options: options)
     }
 
     /// Central-manager construction options for a restore identifier.
@@ -230,7 +251,7 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
                 peripheral = nil
                 pendingRestorationPlan = nil
                 restorationDiscards.append(restored)
-                central.cancelPeripheralConnection(restored)
+                central.cancelConnection(to: restored)
             } else {
                 // iOS state restoration adopted this link at construction;
                 // connect() claims it instead of scanning. The claim is
@@ -263,7 +284,7 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
             // that follows passes the same explicit PocketGATT UUID lists
             // as always. An unknown identifier fails RIGHT HERE — the
             // defined stale/absent behavior, with no fallback device.
-            guard let known = central.retrievePeripherals(withIdentifiers: [target]).first else {
+            guard let known = central.knownPeripheral(withIdentifier: target) else {
                 continuation.resume(throwing: PocketError.deviceNotFound(target))
                 return
             }
@@ -278,12 +299,12 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
             if let index = restorationDiscards.firstIndex(where: { $0 === known }) {
                 restorationDiscards.remove(at: index)
             }
-            known.delegate = self
-            central.connect(known)
+            known.attachDelegate(self)
+            central.connectPeripheral(known)
         } else {
             armedAttempt = attempt
             connectContinuation = continuation
-            central.scanForPeripherals(withServices: nil)
+            central.beginScan()
         }
     }
 
@@ -303,7 +324,7 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
                     return
                 }
                 pendingWrites.append(continuation)
-                peripheral.writeValue(data, for: characteristic, type: .withResponse)
+                peripheral.writeWithResponse(data, to: characteristic)
             }
         }
     }
@@ -417,7 +438,13 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
     /// pending stage still belongs to `attempt`. If the deadline beat the
     /// arming block onto the queue, the attempt is poisoned instead so the
     /// late arming refuses rather than parking a continuation forever.
-    private func failPendingConnect(attempt: Int, with error: Error) {
+    ///
+    /// Internal rather than private so a test can drive the identity guard
+    /// directly: the interleaving it defends against (a resolved attempt's
+    /// cancelled deadline task landing after the NEXT attempt armed) is real
+    /// but not forceable from outside, and a guard nothing can exercise is a
+    /// guard nobody can prove.
+    func failPendingConnect(attempt: Int, with error: Error) {
         queue.async { [self] in
             guard attempt == armedAttempt else {
                 latestFailedAttempt = max(latestFailedAttempt, attempt)
@@ -432,13 +459,13 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
                 connectContinuation = nil
                 armedAttempt = 0
                 commandCharacteristic = nil
-                central.stopScan()
+                central.endScan()
                 // A half-established link (found but not yet resolved) must
                 // not be left dangling behind the failure.
                 if let doomed = peripheral {
                     peripheral = nil
                     restoredAwaitingConnect = false
-                    central.cancelPeripheralConnection(doomed)
+                    central.cancelConnection(to: doomed)
                 }
                 pending.resume(throwing: error)
             }
@@ -455,7 +482,7 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         if let doomed = peripheral {
             peripheral = nil
             restoredAwaitingConnect = false
-            central.cancelPeripheralConnection(doomed)
+            central.cancelConnection(to: doomed)
         }
         guard let pending = connectContinuation else { return }
         connectContinuation = nil
@@ -475,11 +502,11 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         // Unadopted restored links die with the transport. (If the radio
         // never reached poweredOn these cancels are dropped with a CoreBluetooth
         // log line — harmless; there is nothing else to do with them.)
-        for discard in restorationDiscards { central.cancelPeripheralConnection(discard) }
+        for discard in restorationDiscards { central.cancelConnection(to: discard) }
         restorationDiscards = []
         if let doomed = peripheral {
             peripheral = nil
-            central.cancelPeripheralConnection(doomed)
+            central.cancelConnection(to: doomed)
         }
         let writes = pendingWrites
         pendingWrites = []
@@ -490,7 +517,7 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         }
         if let pending = connectContinuation {
             connectContinuation = nil
-            central.stopScan()
+            central.endScan()
             pending.resume(throwing: error)
         }
         responseContinuation.finish()
@@ -514,13 +541,13 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
             // while no connect is armed: a fast caller whose scan raced
             // ahead of willRestoreState (possible when the state property
             // read poweredOn early) keeps its scan.
-            central.stopScan()
+            central.endScan()
         }
         // Belt-and-suspenders with the reclaim in armLink: the same
         // CBPeripheral instance can sit in both roles, and this sweep must
         // never cancel the link the transport is actively driving.
         for discard in restorationDiscards where discard !== peripheral {
-            central.cancelPeripheralConnection(discard)
+            central.cancelConnection(to: discard)
         }
         restorationDiscards = []
         guard let plan = pendingRestorationPlan else { return }
@@ -528,23 +555,24 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         guard let peripheral else { return }   // recovery already failed/closed
         switch plan {
         case .ready:
-            guard let service = peripheral.services?.first(where: { $0.uuid == PocketGATT.service }),
-                  let command = service.characteristics?.first(where: { $0.uuid == PocketGATT.command }),
-                  let response = service.characteristics?.first(where: { $0.uuid == PocketGATT.response }),
-                  let bulkCharacteristic = service.characteristics?.first(where: { $0.uuid == PocketGATT.bulk })
+            let characteristics = peripheral.discoveredServices?
+                .first { $0.uuid == PocketGATT.service }?.discoveredCharacteristics
+            guard let command = characteristics?.first(where: { $0.uuid == PocketGATT.command }),
+                  let response = characteristics?.first(where: { $0.uuid == PocketGATT.response }),
+                  let bulkCharacteristic = characteristics?.first(where: { $0.uuid == PocketGATT.bulk })
             else {
                 // The restored attribute cache thinned out between adoption
                 // and power-up; re-resolve through the normal explicit-UUID
                 // chain instead.
-                peripheral.discoverServices([PocketGATT.service])
+                peripheral.discoverServices(only: [PocketGATT.service])
                 return
             }
             commandCharacteristic = command
             commandPropertiesDescription = Self.describeProperties(command.properties)
             // Restoration preserves CCCD subscriptions; re-arm only what the
             // relaunch actually lost.
-            if !response.isNotifying { peripheral.setNotifyValue(true, for: response) }
-            if !bulkCharacteristic.isNotifying { peripheral.setNotifyValue(true, for: bulkCharacteristic) }
+            if !response.isNotifying { peripheral.setNotify(true, for: response) }
+            if !bulkCharacteristic.isNotifying { peripheral.setNotify(true, for: bulkCharacteristic) }
             // A connect() that raced ahead of willRestoreState (possible when
             // the state property read poweredOn before the first didUpdateState
             // delivered) armed its continuation while commandCharacteristic was
@@ -563,28 +591,101 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
             pending.resume(returning: DiscoveredDevice(name: peripheral.name ?? "",
                                                        identifier: peripheral.identifier))
         case .discoverCharacteristics:
-            guard let service = peripheral.services?.first(where: { $0.uuid == PocketGATT.service }) else {
-                peripheral.discoverServices([PocketGATT.service])
+            guard let service = peripheral.discoveredServices?
+                .first(where: { $0.uuid == PocketGATT.service }) else {
+                peripheral.discoverServices(only: [PocketGATT.service])
                 return
             }
-            peripheral.discoverCharacteristics([PocketGATT.command, PocketGATT.response, PocketGATT.bulk],
+            peripheral.discoverCharacteristics(only: [PocketGATT.command, PocketGATT.response,
+                                                      PocketGATT.bulk],
                                                for: service)
         case .discoverServices:
-            peripheral.discoverServices([PocketGATT.service])
+            peripheral.discoverServices(only: [PocketGATT.service])
         case .awaitSystemConnect:
             // The relaunch restored a connection attempt still in flight.
             // Re-issue it: connect on a connecting peripheral is idempotent,
             // and this guards against the pending request not surviving the
             // relaunch. didConnect then drives the normal discovery chain.
-            central.connect(peripheral)
+            central.connectPeripheral(peripheral)
         }
     }
 }
 
-// MARK: - CoreBluetooth delegates (all callbacks arrive on `queue`)
+// MARK: - CoreBluetooth delegate witnesses
+//
+// FORWARDING ONLY. Each of these hands CoreBluetooth's own objects to the
+// seam handler for the same event and does nothing else. That emptiness is
+// the point: any behavior living here would be reachable only from a real
+// radio, i.e. untested exactly as before. The state machine is in the
+// `BLEDelegate` extension below, where a fake radio can drive it.
 
 extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        bleDidUpdateState(central)
+    }
+
+    #if os(iOS)
+    /// State restoration: iOS relaunched the app for a Bluetooth event and
+    /// hands back the previous life's central. Arrives on `queue` as the very
+    /// first callback, before the initial didUpdateState. macOS has no state
+    /// restoration, so only this witness is platform-gated — the handler it
+    /// forwards to is not, which is what lets `swift test` exercise adoption
+    /// and the mismatch teardown.
+    public func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
+        bleWillRestoreState(central, peripherals: restored)
+    }
+    #endif
+
+    public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+                               advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        bleDidDiscoverPeripheral(peripheral, advertisementData: advertisementData)
+    }
+
+    public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        bleDidConnect(peripheral)
+    }
+
+    public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
+                               error: Error?) {
+        bleDidFailToConnect(peripheral, error: error)
+    }
+
+    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
+                               error: Error?) {
+        bleDidDisconnect(peripheral, error: error)
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        bleDidDiscoverServices(peripheral, error: error)
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
+                           error: Error?) {
+        bleDidDiscoverCharacteristics(peripheral, for: service, error: error)
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic,
+                           error: Error?) {
+        bleDidWriteValue(peripheral, for: characteristic, error: error)
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral,
+                           didUpdateNotificationStateFor characteristic: CBCharacteristic,
+                           error: Error?) {
+        bleDidUpdateNotificationState(peripheral, for: characteristic, error: error)
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
+                           error: Error?) {
+        bleDidUpdateValue(peripheral, for: characteristic, error: error)
+    }
+}
+
+// MARK: - The delegate state machine (all callbacks arrive on `queue`)
+
+extension BLETransport: BLEDelegate {
+    func bleDidUpdateState(_ central: any BLECentral) {
         switch central.state {
         case .poweredOn:
             // Must run before the powered-on continuation resumes: the
@@ -625,13 +726,11 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
-    #if os(iOS)
-    /// State restoration: iOS relaunched the app for a Bluetooth event and
-    /// hands back the previous life's central. Arrives on `queue` as the
-    /// first callback, before the initial didUpdateState. This only RECORDS
-    /// the adoption — the radio is not poweredOn yet and CoreBluetooth drops
-    /// commands issued before it is — so `performDeferredRestoration()`
-    /// executes the plan at the first poweredOn.
+    /// Adopts the previous life's peripheral, or declines and records the
+    /// leftovers for cancellation. This only RECORDS the adoption — the radio
+    /// is not poweredOn yet and CoreBluetooth drops commands issued before it
+    /// is — so `performDeferredRestoration()` executes the plan at the first
+    /// poweredOn.
     ///
     /// Continuation discipline: this callback never resumes, arms, or fails
     /// any continuation, so it cannot double-resume a connect attempt in
@@ -643,8 +742,7 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
     /// snapshot only *searches* the restored attribute arrays for the three
     /// `001120a*` UUIDs, and any discovery the plan later issues passes the
     /// same explicit UUID lists as a scanned connect.
-    public func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
+    func bleWillRestoreState(_ central: any BLECentral, peripherals restored: [any BLEPeripheral]) {
         guard closeReason == nil, self.peripheral == nil, connectContinuation == nil else {
             restorationDiscards.append(contentsOf: restored)
             return
@@ -659,39 +757,37 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
         let adopted = restored[adoption.index]
         peripheral = adopted
-        adopted.delegate = self
+        adopted.attachDelegate(self)
         adoptedFromRestore = true
         restoredAwaitingConnect = true
         pendingRestorationPlan = adoption.plan
     }
-    #endif
 
-    public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
-                               advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        // Discoveries can keep arriving until stopScan takes effect; only the
-        // first matching peripheral wins, and only while a connect is pending.
+    func bleDidDiscoverPeripheral(_ peripheral: any BLEPeripheral, advertisementData: [String: Any]) {
+        // Discoveries can keep arriving until the scan stop takes effect; only
+        // the first matching peripheral wins, and only while a connect is
+        // pending.
         guard self.peripheral == nil, connectContinuation != nil else { return }
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
         guard name.hasPrefix(namePrefix) else { return }
-        central.stopScan()
+        central.endScan()
         self.peripheral = peripheral   // must be retained or the connect is dropped
-        peripheral.delegate = self
-        central.connect(peripheral)
+        peripheral.attachDelegate(self)
+        central.connectPeripheral(peripheral)
     }
 
-    public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    func bleDidConnect(_ peripheral: any BLEPeripheral) {
         // Only the command service — never a nil wildcard (see PocketGATT).
-        peripheral.discoverServices([PocketGATT.service])
+        // The seam cannot express one: `only:` takes a non-optional list.
+        peripheral.discoverServices(only: [PocketGATT.service])
     }
 
-    public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
-                               error: Error?) {
+    func bleDidFailToConnect(_ peripheral: any BLEPeripheral, error: Error?) {
         if discardRestorationLeftover(peripheral) { return }
         failConnect(with: PocketError.transferFailed(error?.localizedDescription ?? "connect failed"))
     }
 
-    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
-                               error: Error?) {
+    func bleDidDisconnect(_ peripheral: any BLEPeripheral, error: Error?) {
         if discardRestorationLeftover(peripheral) { return }
         close(with: PocketError.disconnected)
     }
@@ -704,36 +800,37 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
     /// matches, whatever the discard pile holds — the system hands back one
     /// CBPeripheral instance per identifier, so a leftover can alias the
     /// link the transport is driving, and that link's callbacks are real.
-    private func discardRestorationLeftover(_ peripheral: CBPeripheral) -> Bool {
+    private func discardRestorationLeftover(_ peripheral: any BLEPeripheral) -> Bool {
         guard peripheral !== self.peripheral,
               let index = restorationDiscards.firstIndex(where: { $0 === peripheral }) else { return false }
         restorationDiscards.remove(at: index)
         return true
     }
 
-    public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    func bleDidDiscoverServices(_ peripheral: any BLEPeripheral, error: Error?) {
         if let error {
             failConnect(with: PocketError.transferFailed("service discovery failed: \(error.localizedDescription)"))
             return
         }
-        guard let service = peripheral.services?.first(where: { $0.uuid == PocketGATT.service }) else {
+        guard let service = peripheral.discoveredServices?
+            .first(where: { $0.uuid == PocketGATT.service }) else {
             failConnect(with: PocketError.transferFailed("command service not found"))
             return
         }
         // Exactly the three 001120a* channels — never a nil wildcard.
-        peripheral.discoverCharacteristics([PocketGATT.command, PocketGATT.response, PocketGATT.bulk],
+        peripheral.discoverCharacteristics(only: [PocketGATT.command, PocketGATT.response, PocketGATT.bulk],
                                            for: service)
     }
 
-    public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
-                           error: Error?) {
+    func bleDidDiscoverCharacteristics(_ peripheral: any BLEPeripheral, for service: any BLEService,
+                                       error: Error?) {
         if let error {
             failConnect(with: PocketError.transferFailed("characteristic discovery failed: \(error.localizedDescription)"))
             return
         }
-        var response: CBCharacteristic?
-        var bulkCharacteristic: CBCharacteristic?
-        for characteristic in service.characteristics ?? [] {
+        var response: (any BLECharacteristic)?
+        var bulkCharacteristic: (any BLECharacteristic)?
+        for characteristic in service.discoveredCharacteristics ?? [] {
             switch characteristic.uuid {
             case PocketGATT.command:
                 commandCharacteristic = characteristic
@@ -750,8 +847,8 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
         // ATT serialises one transaction at a time, so these CCCD writes are
         // queued ahead of any later command write: notifications are armed on
         // the device before the session's handshake can reach it.
-        peripheral.setNotifyValue(true, for: response)
-        peripheral.setNotifyValue(true, for: bulkCharacteristic)
+        peripheral.setNotify(true, for: response)
+        peripheral.setNotify(true, for: bulkCharacteristic)
         guard let pending = connectContinuation else { return }
         connectContinuation = nil
         armedAttempt = 0
@@ -759,8 +856,8 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
                                                    identifier: peripheral.identifier))
     }
 
-    public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic,
-                           error: Error?) {
+    func bleDidWriteValue(_ peripheral: any BLEPeripheral, for characteristic: any BLECharacteristic,
+                          error: Error?) {
         guard characteristic.uuid == PocketGATT.command, !pendingWrites.isEmpty else { return }
         let continuation = pendingWrites.removeFirst()
         if let error {
@@ -774,8 +871,8 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
     /// CLI harness can distinguish "notify never armed" from "device silent".
     /// Runs on `queue` like every delegate callback; mutates nothing but the
     /// diagnostic record.
-    public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
-                           error: Error?) {
+    func bleDidUpdateNotificationState(_ peripheral: any BLEPeripheral,
+                                       for characteristic: any BLECharacteristic, error: Error?) {
         let channel: String
         switch characteristic.uuid {
         case PocketGATT.response: channel = "response"
@@ -789,7 +886,7 @@ extension BLETransport: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
-    public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
+    func bleDidUpdateValue(_ peripheral: any BLEPeripheral, for characteristic: any BLECharacteristic,
                            error: Error?) {
         guard error == nil, let value = characteristic.value else { return }
         switch characteristic.uuid {
@@ -878,14 +975,16 @@ enum BLERestoration {
     }
 }
 
-#if os(iOS)
 extension BLERestoration.PeripheralSnapshot {
     /// Reads already-restored attribute arrays only — property access, no
     /// discovery, no radio traffic — and only *searches* them for the three
     /// PocketGATT UUIDs, never enumerating anything else.
-    init(of peripheral: CBPeripheral) {
-        let service = peripheral.services?.first { $0.uuid == PocketGATT.service }
-        let characteristics = service?.characteristics ?? []
+    ///
+    /// Not platform-gated: it reads seam values, so it compiles and runs
+    /// wherever the tests do, even though only iOS ever restores state.
+    init(of peripheral: any BLEPeripheral) {
+        let service = peripheral.discoveredServices?.first { $0.uuid == PocketGATT.service }
+        let characteristics = service?.discoveredCharacteristics ?? []
         self.init(name: peripheral.name,
                   state: peripheral.state,
                   hasCommandService: service != nil,
@@ -894,4 +993,3 @@ extension BLERestoration.PeripheralSnapshot {
                   hasBulkCharacteristic: characteristics.contains { $0.uuid == PocketGATT.bulk })
     }
 }
-#endif

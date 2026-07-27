@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/swift-6.0%20toolchain-27272a?style=flat-square&labelColor=27272a&color=52525b" alt="Swift 6.0 toolchain">
   <img src="https://img.shields.io/badge/platforms-iOS%2017%20%7C%20macOS%2014-27272a?style=flat-square&labelColor=27272a&color=52525b" alt="Platforms: iOS 17, macOS 14">
   <img src="https://img.shields.io/badge/dependencies-none-27272a?style=flat-square&labelColor=27272a&color=52525b" alt="Dependencies: none">
-  <img src="https://img.shields.io/badge/tests-137%20hermetic-27272a?style=flat-square&labelColor=27272a&color=52525b" alt="Tests: 137 hermetic">
+  <a href="https://github.com/Enigma-Labs-Technology/pocket-client/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Enigma-Labs-Technology/pocket-client/ci.yml?branch=main&style=flat-square&labelColor=27272a&color=52525b&label=ci" alt="CI status"></a>
   <img src="https://img.shields.io/badge/license-Apache--2.0-27272a?style=flat-square&labelColor=27272a&color=52525b" alt="License: Apache-2.0">
 </p>
 
@@ -264,7 +264,7 @@ the index.
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/kernelalex/pocket-client.git", from: "0.1.0"),
+    .package(url: "https://github.com/Enigma-Labs-Technology/pocket-client.git", from: "0.1.0"),
 ],
 targets: [
     .target(name: "YourApp", dependencies: [
@@ -274,7 +274,7 @@ targets: [
 ```
 
 In Xcode: **File → Add Package Dependencies**, then paste
-`https://github.com/kernelalex/pocket-client.git`.
+`https://github.com/Enigma-Labs-Technology/pocket-client.git`.
 
 > [!NOTE]
 > **The version is `0.x` on purpose.** Under semver, `1.0.0` is a promise of API
@@ -299,8 +299,10 @@ App-side obligations on iOS:
 
 ## 1 · Discover a device
 
-**Evidence:** `hardware` for the scan and both connect paths; `compile-only`
-for the state-restoration branch — see
+**Evidence:** `hardware` for the scan and both connect paths, and both are
+additionally covered in `swift test` — including that a targeted connect never
+falls back to a different Pocket; `compile-only` for the state-restoration
+branch — see
 [10 · Run in the background on iOS](#10--run-in-the-background-on-ios).
 
 `BLETransport.connect()` takes whichever `PKT01_*` advertiser answers first —
@@ -1088,10 +1090,13 @@ accepted, because a future device may not use 16 characters.
 
 ## 10 · Run in the background on iOS
 
-**Evidence:** `compile-only`. macOS cannot execute CoreBluetooth state
-restoration, and `BLETransport` deliberately has no mock CoreBluetooth layer, so
-only the pure restoration *policy* is unit-tested. **This has never run on a
-phone.**
+**Evidence:** `compile-only`. The restoration logic — adoption, the deferred
+execution at power-up, `connect()` claiming the restored link, the mismatch
+teardown, the leftover bookkeeping — is driven end to end by `swift test` against
+a fake radio behind `BLETransport`'s internal CoreBluetooth seam. What that
+cannot establish is whether iOS relaunches the app and hands back the peripherals
+we assume: only the `willRestoreState` delegate witness is iOS-only, and **this
+has never run on a phone.**
 
 `BLETransport` supports CoreBluetooth state restoration, so a sync app can be
 relaunched in the background for Bluetooth events on a link it held when iOS
@@ -1498,16 +1503,33 @@ DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
   xcodebuild -scheme PocketClient -sdk iphoneos27.0 -destination 'generic/platform=iOS' build
 ```
 
-`BLETransport`'s CoreBluetooth shell, `PocketScanner`'s CoreBluetooth shell, and
-the iOS hotspot join are the only code paths `swift test` cannot cover — which is
-what `pocket-cli` exists for. Everything that can be made pure has been, and is
-covered: the scan-list policy (dedupe, RSSI refresh, ordering, age-out), the
-radio-state mapping, and the state-restoration plan selection are all plain value
-types with no radio in them.
+`PocketScanner`'s CoreBluetooth shell, the thirty-line CoreBluetooth adapter at
+the bottom of `BLESeam.swift`, and the iOS hotspot join are the only code paths
+`swift test` cannot cover — which is what `pocket-cli` exists for.
 
-Two of those tests are load-bearing for safety rather than correctness: a
+`BLETransport` used to be on that list. It reaches CoreBluetooth only through an
+internal seam (`BLECentral` / `BLEPeripheral`), so the whole state machine runs
+in-process against a fake radio: connect and its timeout, targeted connect and
+its refusal to fall back, disconnect mid-connect and mid-transfer, cancellation
+at every suspension point, the attempt-token discipline, and state restoration
+including the mismatch teardown. The seam is internal — the public surface is
+unchanged, and `PocketTransport` remains the abstraction third-party code
+implements. Everything that can be made pure has been, and is covered too: the
+scan-list policy (dedupe, RSSI refresh, ordering, age-out), the radio-state
+mapping, and the state-restoration plan selection are all plain value types with
+no radio in them.
+
+Three tests are load-bearing for safety rather than correctness: a
 compiler-forced exhaustive walk over every `Command` case asserting that no
-generated wire frame ever contains an OTA, rebind, or provisioning substring.
+generated wire frame ever contains an OTA, rebind, or provisioning substring; and
+two that record every GATT discovery call the transport makes and assert the UUID
+lists are exactly the command service and its three channels — on a fake device
+carrying the recorder's real map, `ffd0` and both combo-chip services included.
+The wildcard `nil` CoreBluetooth accepts is not merely unused: the seam's
+discovery methods take a non-optional list, so it cannot be written.
+
+The suite ships **one known-failing test**, so `swift test` ends on a `━` line
+rather than a `✔`. That is deliberate — see the `compile-only` entry below.
 
 ---
 
@@ -1527,7 +1549,10 @@ there is no pause/resume API. A negative result is still a result.
 
 **`compile-only`** — CoreBluetooth state restoration, and the iOS programmatic
 hotspot join (`SystemHotspotJoiner`, via `NEHotspotConfiguration`). Neither has
-executed on a phone.
+executed on a phone. Restoration's *logic* is now unit-tested end to end against
+a fake radio, which is why one known-failing test ships with the package: see
+`aCancelledLeftoverMustNotTearDownTheAdoptedLink`, a defect that was invisible
+until the transport became testable.
 
 **`inferred`** — four things, and each is treated as a reason for caution rather
 than a claim:
