@@ -1528,8 +1528,9 @@ carrying the recorder's real map, `ffd0` and both combo-chip services included.
 The wildcard `nil` CoreBluetooth accepts is not merely unused: the seam's
 discovery methods take a non-optional list, so it cannot be written.
 
-The suite ships **one known-failing test**, so `swift test` ends on a `━` line
-rather than a `✔`. That is deliberate — see the `compile-only` entry below.
+The suite is fully green: `swift test` ends on a `✔`. It shipped one
+known-failing test in 0.1.0 — a state-restoration defect the new seam exposed on
+the day it existed — and that test is now an ordinary passing regression test.
 
 ---
 
@@ -1550,9 +1551,10 @@ there is no pause/resume API. A negative result is still a result.
 **`compile-only`** — CoreBluetooth state restoration, and the iOS programmatic
 hotspot join (`SystemHotspotJoiner`, via `NEHotspotConfiguration`). Neither has
 executed on a phone. Restoration's *logic* is now unit-tested end to end against
-a fake radio, which is why one known-failing test ships with the package: see
-`aCancelledLeftoverMustNotTearDownTheAdoptedLink`, a defect that was invisible
-until the transport became testable.
+a fake radio, and that is not a formality: the first test to reach the
+unadopted-leftover branch found it broken, in a way that killed the restored link
+on a background relaunch. Fixed in 0.1.1. What the tests still cannot establish
+is whether iOS relaunches the app and hands back the peripherals we assume.
 
 **`inferred`** — four things, and each is treated as a reason for caution rather
 than a claim:

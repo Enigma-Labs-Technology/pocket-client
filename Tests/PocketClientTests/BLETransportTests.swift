@@ -728,29 +728,14 @@ private let isWrite: @Sendable (BLECall) -> Bool = { call in
 
 @Test func responseAndBulkPayloadsReachTheirOwnStreams() async throws {
     let (transport, _, pocket) = try await FakeBLE.connected()
-    let responses = Task { () throws -> [Data] in
-        var out: [Data] = []
-        for await payload in transport.responseStream() {
-            out.append(payload)
-            if out.count == 2 { break }
-        }
-        return out
-    }
-    let bulk = Task { () throws -> [Data] in
-        var out: [Data] = []
-        for await payload in transport.bulkStream() {
-            out.append(payload)
-            if out.count == 1 { break }
-        }
-        return out
-    }
 
     pocket.notify(PocketGATT.response, Data("MCU&SK&OK".utf8))
     pocket.notify(PocketGATT.bulk, Data([0xFF, 0xF3, 0x48, 0xC4]))
     pocket.notify(PocketGATT.response, Data("MCU&STE&0".utf8))
 
-    #expect(try await responses.value == [Data("MCU&SK&OK".utf8), Data("MCU&STE&0".utf8)])
-    #expect(try await bulk.value == [Data([0xFF, 0xF3, 0x48, 0xC4])])
+    #expect(await payloads(2, from: transport.responseStream())
+            == [Data("MCU&SK&OK".utf8), Data("MCU&STE&0".utf8)])
+    #expect(await payloads(1, from: transport.bulkStream()) == [Data([0xFF, 0xF3, 0x48, 0xC4])])
     await transport.disconnect()
 }
 
@@ -760,18 +745,10 @@ private let isWrite: @Sendable (BLECall) -> Bool = { call in
 @Test func bulkChunkOrderIsPreserved() async throws {
     let (transport, _, pocket) = try await FakeBLE.connected()
     let chunks = (0..<200).map { Data([UInt8($0 % 256), UInt8($0 / 256)]) }
-    let collected = Task { () throws -> [Data] in
-        var out: [Data] = []
-        for await payload in transport.bulkStream() {
-            out.append(payload)
-            if out.count == chunks.count { break }
-        }
-        return out
-    }
 
     for chunk in chunks { pocket.notify(PocketGATT.bulk, chunk) }
 
-    #expect(try await collected.value == chunks)
+    #expect(await payloads(chunks.count, from: transport.bulkStream()) == chunks)
     await transport.disconnect()
 }
 
@@ -779,15 +756,11 @@ private let isWrite: @Sendable (BLECall) -> Bool = { call in
 /// mis-routed: the response stream sees only the response channel.
 @Test func aNotificationOnAForeignChannelIsIgnored() async throws {
     let (transport, _, pocket) = try await FakeBLE.connected()
-    let responses = Task { () throws -> Data? in
-        for await payload in transport.responseStream() { return payload }
-        return nil
-    }
 
     pocket.notify(FakeBLE.batteryLevel, Data([99]))
     pocket.notify(PocketGATT.response, Data("MCU&SK&OK".utf8))
 
-    #expect(try await responses.value == Data("MCU&SK&OK".utf8))
+    #expect(await firstPayload(from: transport.responseStream()) == Data("MCU&SK&OK".utf8))
     await transport.disconnect()
 }
 

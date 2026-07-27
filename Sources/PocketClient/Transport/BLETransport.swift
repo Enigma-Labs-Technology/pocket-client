@@ -502,6 +502,15 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         // Unadopted restored links die with the transport. (If the radio
         // never reached poweredOn these cancels are dropped with a CoreBluetooth
         // log line — harmless; there is nothing else to do with them.)
+        //
+        // Clearing the pile is right HERE, unlike in performDeferredRestoration:
+        // past this point nothing distinguishes bookkeeping from a teardown,
+        // because there is no teardown left to do. `closeReason` is already
+        // set, every continuation slot is nil and both streams are finished, so
+        // a leftover's disconnect callback arriving later finds an empty pile,
+        // re-enters this funnel and changes nothing. The pile may now hold
+        // peripherals performDeferredRestoration already cancelled; a second
+        // cancel on a link that is already down is a no-op.
         for discard in restorationDiscards { central.cancelConnection(to: discard) }
         restorationDiscards = []
         if let doomed = peripheral {
@@ -545,11 +554,27 @@ public final class BLETransport: NSObject, PocketTransport, @unchecked Sendable 
         }
         // Belt-and-suspenders with the reclaim in armLink: the same
         // CBPeripheral instance can sit in both roles, and this sweep must
-        // never cancel the link the transport is actively driving.
-        for discard in restorationDiscards where discard !== peripheral {
-            central.cancelConnection(to: discard)
-        }
-        restorationDiscards = []
+        // never cancel the link the transport is actively driving. Filtering
+        // (rather than skipping) also drops any such alias from the pile, so
+        // the active link's callbacks can never be misread as bookkeeping —
+        // exactly what clearing the whole array used to guarantee.
+        let doomed = restorationDiscards.filter { $0 !== peripheral }
+        for discard in doomed { central.cancelConnection(to: discard) }
+        // The cancelled leftovers stay LISTED until their callbacks arrive.
+        // Cancelling a live link makes CoreBluetooth report it disconnected,
+        // and `discardRestorationLeftover` removing the entry is the only
+        // thing that tells that callback apart from a real teardown: emptying
+        // the pile here left the callback to fall through the teardown funnel
+        // and kill the link that WAS adopted.
+        //
+        // An entry whose callback never comes (a cancelled *pending* connect
+        // may produce none) simply waits for `close`, which clears the pile
+        // wholesale. That residue is inert: re-cancelling it on a later
+        // poweredOn is a no-op, and it cannot mislabel a future link's
+        // callbacks — a peripheral that becomes the active one is either
+        // reclaimed out of the pile by armLink or excluded by the identity
+        // guard in `discardRestorationLeftover`.
+        restorationDiscards = doomed
         guard let plan = pendingRestorationPlan else { return }
         pendingRestorationPlan = nil
         guard let peripheral else { return }   // recovery already failed/closed

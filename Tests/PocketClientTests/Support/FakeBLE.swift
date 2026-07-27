@@ -19,6 +19,7 @@
 // because the test thread reads it while the queue writes it.
 import Foundation
 import CoreBluetooth
+import Testing
 @testable import PocketClient
 
 // MARK: - Recording
@@ -288,45 +289,59 @@ final class FakePeripheral: BLEPeripheral, @unchecked Sendable {
     /// Emits a notification on a channel, the way the device does. Sequential
     /// calls keep their order: each is its own queue block, and the value is
     /// set inside it, immediately before the callback that reads it.
-    func notify(_ channel: CBUUID, _ payload: Data) {
-        guard let characteristic = service(containing: channel) else { return }
-        deliver {
+    func notify(_ channel: CBUUID, _ payload: Data,
+                sourceLocation: SourceLocation = #_sourceLocation) {
+        guard let characteristic = service(containing: channel) else {
+            Issue.record("no characteristic \(channel) on this device", sourceLocation: sourceLocation)
+            return
+        }
+        driveOrReport("a notification on \(channel)", {
             characteristic.value = payload
             $0.bleDidUpdateValue(self, for: characteristic, error: nil)
-        }
+        }, sourceLocation: sourceLocation)
     }
 
     /// Acknowledges the oldest unacknowledged write, for a peripheral whose
     /// `writeOutcome` is `.silent`.
-    func acknowledgeWrite(channel: CBUUID = PocketGATT.command, error: (any Error)? = nil) {
-        guard let characteristic = service(containing: channel) else { return }
-        deliver { $0.bleDidWriteValue(self, for: characteristic, error: error) }
+    func acknowledgeWrite(channel: CBUUID = PocketGATT.command, error: (any Error)? = nil,
+                          sourceLocation: SourceLocation = #_sourceLocation) {
+        guard let characteristic = service(containing: channel) else {
+            Issue.record("no characteristic \(channel) on this device", sourceLocation: sourceLocation)
+            return
+        }
+        driveOrReport("a write acknowledgement on \(channel)", {
+            $0.bleDidWriteValue(self, for: characteristic, error: error)
+        }, sourceLocation: sourceLocation)
     }
 
     /// Reports the notification state the device chose, for a `.silent`
     /// `notifyOutcome` — including "enabled the write, but reported off".
-    func reportNotifyState(_ channel: CBUUID, notifying: Bool, error: (any Error)? = nil) {
-        guard let characteristic = service(containing: channel) else { return }
-        deliver {
+    func reportNotifyState(_ channel: CBUUID, notifying: Bool, error: (any Error)? = nil,
+                           sourceLocation: SourceLocation = #_sourceLocation) {
+        guard let characteristic = service(containing: channel) else {
+            Issue.record("no characteristic \(channel) on this device", sourceLocation: sourceLocation)
+            return
+        }
+        driveOrReport("a notification-state report on \(channel)", {
             characteristic.isNotifying = notifying
             $0.bleDidUpdateNotificationState(self, for: characteristic, error: error)
-        }
+        }, sourceLocation: sourceLocation)
     }
 
     /// The device (or the link) goes away on its own.
-    func dropLink(error: (any Error)? = nil) {
-        deliver {
+    func dropLink(error: (any Error)? = nil, sourceLocation: SourceLocation = #_sourceLocation) {
+        driveOrReport("a link drop", {
             self.state = .disconnected
             $0.bleDidDisconnect(self, error: error)
-        }
+        }, sourceLocation: sourceLocation)
     }
 
     /// Completes a `.silent` connect attempt.
-    func completeConnect() {
-        deliver {
+    func completeConnect(sourceLocation: SourceLocation = #_sourceLocation) {
+        driveOrReport("a connect completion", {
             self.state = .connected
             $0.bleDidConnect(self)
-        }
+        }, sourceLocation: sourceLocation)
     }
 
     /// Fills in the attribute cache iOS hands back through state restoration:
@@ -355,6 +370,33 @@ final class FakePeripheral: BLEPeripheral, @unchecked Sendable {
             guard let delegate else { return }
             body(delegate)
         }
+    }
+
+    /// `deliver` for the test-side drive helpers, which reports rather than
+    /// shrugs when the peripheral has no delegate.
+    ///
+    /// A peripheral only gets one when the transport attaches it, so driving
+    /// one it never adopted means the test is wrong about what the transport
+    /// did. Silently dropping the delivery turns that into an eternal wait on
+    /// a stream that will never yield — a hung suite reports NOTHING, which is
+    /// the worst failure mode a test can have. (The scripted radio replies
+    /// keep the quiet path: a discarded leftover legitimately has no delegate.)
+    private func driveOrReport(_ what: String, _ body: @escaping (any BLEDelegate) -> Void,
+                               sourceLocation: SourceLocation = #_sourceLocation) {
+        guard queue != nil else {
+            Issue.record("\(name ?? "peripheral") was never attached to a central; \(what) went nowhere",
+                         sourceLocation: sourceLocation)
+            return
+        }
+        guard delegate != nil else {
+            Issue.record("""
+                \(name ?? "peripheral") has no delegate — the transport never attached it, \
+                so \(what) went nowhere. The test is driving a peripheral the transport is \
+                not talking to.
+                """, sourceLocation: sourceLocation)
+            return
+        }
+        deliver(body)
     }
 }
 
@@ -606,6 +648,32 @@ func outcome<T: Sendable>(of task: Task<T, any Error>,
         try? await Task.sleep(for: .milliseconds(1))
     }
     return box.value
+}
+
+/// The next `count` payloads from a stream, or nil if they do not all arrive.
+///
+/// Bounded for the same reason as `outcome(of:)`: a stream that never yields
+/// suspends its reader forever, and swift-testing then waits forever for that
+/// test — the whole run ends up reporting nothing at all. Ask for what you
+/// expect and let the deadline turn a silent hang into a named failure.
+func payloads(_ count: Int, from stream: AsyncStream<Data>,
+              within: Duration = .seconds(5)) async -> [Data]? {
+    let reader = Task { () throws -> [Data] in
+        var collected: [Data] = []
+        for await payload in stream {
+            collected.append(payload)
+            if collected.count == count { break }
+        }
+        return collected
+    }
+    guard let result = await outcome(of: reader, within: within),
+          let collected = try? result.get(), collected.count == count else { return nil }
+    return collected
+}
+
+/// The first payload a stream delivers, or nil if none arrives in time.
+func firstPayload(from stream: AsyncStream<Data>, within: Duration = .seconds(5)) async -> Data? {
+    await payloads(1, from: stream, within: within)?.first
 }
 
 private final class OutcomeBox<T: Sendable>: @unchecked Sendable {

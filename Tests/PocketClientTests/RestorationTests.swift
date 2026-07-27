@@ -363,12 +363,8 @@ private let prefix = PocketGATT.namePrefix
     #expect(!central.log.contains(.cancelConnection(pocket.identifier)),
             "the leftover sweep cancelled the link the transport is driving")
     // Still live: the link the sweep spared really works.
-    let responses = Task { () throws -> Data? in
-        for await payload in transport.responseStream() { return payload }
-        return nil
-    }
     pocket.notify(PocketGATT.response, Data("MCU&SK&OK".utf8))
-    #expect(try await responses.value == Data("MCU&SK&OK".utf8))
+    #expect(await firstPayload(from: transport.responseStream()) == Data("MCU&SK&OK".utf8))
     await transport.disconnect()
 }
 
@@ -396,49 +392,109 @@ private let prefix = PocketGATT.namePrefix
     await transport.disconnect()
 }
 
-/// FOUND BY THIS SEAM. A pre-existing defect, deliberately NOT fixed here —
-/// this task was a refactor for testability, and a semantic change smuggled
-/// into it would be the hardest kind to review. It is recorded in the codebase
-/// rather than only in a report, so it cannot be lost.
+/// REGRESSION. This branch was unreachable until `BLETransport` gained its
+/// CoreBluetooth seam, and the first test to reach it found it broken.
 ///
-/// THE DEFECT. A restored link that is still UP but not adopted is cancelled
-/// at power-on, and CoreBluetooth answers a cancel on a live link with a
-/// disconnect callback. By then `performDeferredRestoration` has already run
-/// `restorationDiscards = []`, so when that callback lands
-/// `discardRestorationLeftover` no longer recognises it as bookkeeping: it
-/// falls through to the teardown funnel and closes the transport — killing the
-/// link that WAS adopted. Two restored Pockets, or one stale link alongside
-/// the live one, is all it takes. `connect()` then fails `.disconnected` on a
-/// background relaunch, which is the exact scenario the feature exists for.
+/// A restored link that is still UP but not adopted is cancelled at power-on,
+/// and CoreBluetooth answers a cancel on a live link with a disconnect
+/// callback. `performDeferredRestoration` used to run `restorationDiscards = []`
+/// as it issued those cancels, so by the time the callback landed
+/// `discardRestorationLeftover` no longer recognised it as bookkeeping: it fell
+/// through the teardown funnel and closed the transport — killing the link that
+/// WAS adopted. Two restored Pockets, or one stale link alongside the live one,
+/// was all it took, and `connect()` then failed `.disconnected` on a background
+/// relaunch, the exact scenario the feature exists for.
 ///
-/// THE FIX (proposed, not applied): keep the cancelled leftovers listed
-/// instead of clearing them, and let `discardRestorationLeftover` remove each
-/// as its callback arrives — that removal is the only thing that distinguishes
-/// bookkeeping from a real teardown.
-///
-///     let doomed = restorationDiscards.filter { $0 !== peripheral }
-///     for discard in doomed { central.cancelConnection(to: discard) }
-///     restorationDiscards = doomed
-///
-/// The assertion below is the INTENDED behavior, marked known-failing rather
-/// than weakened to match the bug. When the transport is fixed this test
-/// starts passing and `withKnownIssue` fails loudly, which is the point.
-@Test func aCancelledLeftoverMustNotTearDownTheAdoptedLink() async throws {
+/// The fix keeps the cancelled leftovers LISTED, so the removal in
+/// `discardRestorationLeftover` is what drains them — that removal being the
+/// only thing that tells a bookkeeping callback from a real one.
+@Test func aCancelledLeftoverDoesNotTearDownTheAdoptedLink() async throws {
     let central = FakeCentral(state: .unknown)
     let adopted = FakeBLE.pocket(name: "PKT01_ADOPTED")
     adopted.state = .connected
     adopted.restoreFullCache()
     let leftover = FakeBLE.pocket(name: "PKT01_LEFTOVER")
-    leftover.state = .connected          // a LIVE link, adopted second and so declined
+    leftover.state = .connected          // a LIVE link, adoptable but adopted second
     leftover.restoreFullCache()
     central.restored = [adopted, leftover]
     let transport = FakeBLE.transport(central, restoreIdentifier: "pocket.central")
 
     central.power(.poweredOn)
     #expect(await central.log.wait(for: .cancelConnection(leftover.identifier)))
+    await central.settle()               // the leftover's disconnect callback lands here
 
-    await withKnownIssue("restorationDiscards is emptied before the disconnect callbacks arrive") {
-        let device = try await transport.connect(timeout: .seconds(2))
-        #expect(device.identifier == adopted.identifier)
+    let device = try await transport.connect(timeout: .seconds(5))
+    #expect(device.identifier == adopted.identifier)
+    #expect(await transport.wasRestored())
+    // The adopted link is not merely reported: it works.
+    adopted.notify(PocketGATT.response, Data("MCU&SK&OK".utf8))
+    #expect(await firstPayload(from: transport.responseStream()) == Data("MCU&SK&OK".utf8))
+    // And the leftover really was dropped — it does not keep holding the radio.
+    #expect(!central.log.contains(.cancelConnection(adopted.identifier)))
+    await transport.disconnect()
+}
+
+/// The residue question the fix raises: a cancelled leftover whose disconnect
+/// callback NEVER arrives (a cancelled pending connect may produce none) stays
+/// listed until `close`. That entry must be inert — in particular it must not
+/// let a later, genuine disconnect be mistaken for bookkeeping.
+@Test func aLeftoverWhoseCallbackNeverArrivesCannotAffectALaterLink() async throws {
+    let central = FakeCentral(state: .unknown)
+    // Live, so cancelling it is a real cancel — but outside the name family,
+    // so it is never adopted. (A PKT01_ device with a live link WOULD be
+    // adopted, which is the whole point of the adoption rule.)
+    let silentLeftover = FakeBLE.pocket(name: "OTHER_SILENT")
+    silentLeftover.state = .connected
+    silentLeftover.disconnectOnCancel = .never   // cancelled, and never answers
+    let dead = FakeBLE.pocket(name: "PKT01_DEAD")  // ours, but its link is gone
+    central.restored = [dead, silentLeftover]      // so nothing here is adoptable
+    let transport = FakeBLE.transport(central, restoreIdentifier: "pocket.central")
+
+    central.power(.poweredOn)
+    #expect(await central.log.wait(for: .cancelConnection(silentLeftover.identifier)))
+    #expect(await transport.wasRestored() == false)
+
+    // A perfectly ordinary scanning connect, with the undrained entry still listed.
+    let fresh = FakeBLE.pocket()
+    central.advertise(fresh)
+    let device = try await transport.connect(timeout: .seconds(5))
+    #expect(device.identifier == fresh.identifier)
+
+    // A second poweredOn re-runs the deferred sweep with the residue still
+    // listed. It must sweep the residue and nothing else.
+    central.power(.poweredOn)
+    await central.settle()
+    #expect(!central.log.contains(.cancelConnection(fresh.identifier)),
+            "the undrained residue made a later sweep cancel the live link")
+
+    // And the live link is still live.
+    fresh.notify(PocketGATT.response, Data("MCU&SK&OK".utf8))
+    #expect(await firstPayload(from: transport.responseStream()) == Data("MCU&SK&OK".utf8))
+    await transport.disconnect()
+}
+
+/// The other half of the fix's reasoning. `close` still empties the pile
+/// wholesale, and that is correct rather than inconsistent: past the teardown
+/// funnel there is no teardown left to tell a bookkeeping callback apart from.
+/// A leftover cancelled BY `close` answers after the pile is already gone,
+/// re-enters the funnel and must change nothing — if that funnel were not
+/// idempotent this test would trap on a continuation resumed twice.
+@Test func aLeftoverCancelledByCloseMayAnswerAfterwardsHarmlessly() async throws {
+    let central = FakeCentral(state: .unknown)
+    central.announcesStateAtLaunch = false      // no power-up sweep: the pile survives to close
+    let leftover = FakeBLE.pocket(name: "OTHER_LEFTOVER")
+    leftover.state = .connected
+    leftover.disconnectOnCancel = .always       // it WILL answer, once the pile is gone
+    central.restored = [leftover]
+    let transport = FakeBLE.transport(central, restoreIdentifier: "pocket.central")
+    await central.settle()
+
+    await transport.disconnect()                // close cancels the leftover…
+    await central.settle()                      // …and its callback lands here
+
+    #expect(central.log.contains(.cancelConnection(leftover.identifier)))
+    await #expect(throws: PocketError.disconnected) { try await transport.send(Data()) }
+    await #expect(throws: PocketError.disconnected) {
+        _ = try await transport.connect(timeout: .seconds(1))
     }
 }

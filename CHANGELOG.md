@@ -13,7 +13,26 @@ notes for a release before upgrading.
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- **iOS state restoration: a cancelled leftover no longer tears down the
+  restored link.** When a relaunch handed back more than one live link, the
+  transport adopted the first and cancelled the rest — but emptied its record of
+  those cancelled peripherals *as it issued the cancels*, before CoreBluetooth
+  could report them disconnected. Each of those callbacks then looked like a
+  real teardown rather than the bookkeeping it was, and closed the transport,
+  killing the link that had just been adopted. `connect()` failed
+  `PocketError.disconnected` on exactly the background relaunch the feature
+  exists for. The cancelled peripherals now stay recorded until their callbacks
+  arrive, since removing each on arrival is the only thing that distinguishes
+  bookkeeping from a teardown. (`compile-only` — reproduced and fixed against a
+  fake radio; still not exercised on a phone.)
+
+  The branch was unreachable by any test until `BLETransport` gained its
+  internal CoreBluetooth seam in 0.1.0; the first test written against it found
+  this. 0.1.0 shipped that test known-failing rather than silently weakened, so
+  the suite in 0.1.0 ends on a `━` line. It is now an ordinary passing
+  regression test and the suite is green.
 
 ## [0.1.0] — 2026-07-26
 
