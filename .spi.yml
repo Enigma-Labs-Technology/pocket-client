@@ -1,0 +1,12 @@
+# Swift Package Index build configuration.
+# https://swiftpackageindex.com/SwiftPackageIndex/SPIManifest/documentation
+#
+# SPI builds this package against current Swift versions and platforms and
+# publishes the resulting compatibility matrix. That matrix is evidence rather
+# than a claim, which is the standard the rest of this project holds itself to.
+version: 1
+builder:
+  configs:
+    # DocC for the library. The executable target is a hardware harness, not
+    # API, so it is deliberately not documented here.
+    - documentation_targets: [PocketClient]

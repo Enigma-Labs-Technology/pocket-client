@@ -1,0 +1,29 @@
+# SwiftPM / Xcode build output
+build/
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserdatad/
+xcuserdata/
+Package.resolved
+
+# Audio. The CLI writes recordings into the working directory (`listen` →
+# live.mp3, `download` → <timestamp>.mp3). These are somebody's voice — they
+# must never be committed. The one intentional exception is the hermetic test
+# fixture, which is force-added below.
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.caf
+!Tests/PocketClientTests/Fixtures/golden.mp3
+
+# Packet captures and device logs (they carry the session key in cleartext —
+# the protocol is plain ASCII)
+*.pcap
+*.pcapng
+*.btsnoop
+btsnoop*.log
+
+# macOS
+.DS_Store
