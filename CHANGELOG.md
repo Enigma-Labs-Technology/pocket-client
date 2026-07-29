@@ -13,6 +13,48 @@ notes for a release before upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- **A rebind propagates to the Wi-Fi AP password — VERIFIED on hardware
+  (2026-07-28).** The protocol reference said the AP password is the session
+  key's first 8 characters but never said *when* it is derived, and nobody had
+  previously rebound a device and then used Wi-Fi on it. It follows the live
+  binding: after `APP&BLE&RESET` plus an `adopt`, the device reported the **new**
+  key's first 8 characters, surviving the reset and the reboot. The consequence
+  is the operationally important part, and it is now documented in
+  [the protocol reference](docs/protocol/ble-protocol.md) and the README: the
+  SSID *is* the BLE name and does not change with the password, so **every host
+  that has ever joined that AP now holds a stale credential**, and no app can
+  clear it — `removeConfiguration(forSSID:)` only removes configurations the app
+  itself created, and neither iOS nor macOS exposes any API that removes a
+  user-saved network. It has to be forgotten by hand. (`hardware`, one device.)
+
+- **A failed Wi-Fi join now names its most likely cause.** Both platforms report
+  a join failure as one opaque line — iOS as *"Unable to join the network …"*,
+  macOS as no join error at all, just a TCP connect that times out — and neither
+  distinguishes a stale saved password from an access point that is down. That
+  ambiguity cost three hardware probes to resolve. The package holds one fact the
+  OS does not: the session key, from which the AP password is derived. It now
+  compares that against the password the device reports over BLE and says whether
+  the *device* is self-consistent. When it is, the error states that the
+  credentials handed to the OS were right and the fault is this host's saved
+  network, and names the manual repair. A disagreement is reported as a firmware
+  finding, explicitly **not** as the failure's cause — the join uses the device's
+  value, which is authoritative. Neither password appears in the message, so a
+  failure stays safe to paste into a bug report.
+
+  Carried on both shapes of the failure: the join error, and a TCP connect that
+  fails while the device reported **no** client on its AP (`APP&WIFIS` at `3` and
+  never `2`) — the macOS shape, where the join itself cannot fail. When the
+  device *did* report an associated client the message is left alone: the host is
+  demonstrably on the AP. `ManualHotspotJoiner` also warns the operator before
+  they join, since on 2026-07-28 it printed the correct password and the operator
+  still joined with the one the Mac remembered.
+
+  No behaviour change to the transfer sequence, and no new error case:
+  `PocketError.wifiJoinFailed` / `.transferFailed` carry richer detail strings.
+  Callers that match on those strings will see the new text.
+
 ### Fixed
 
 - **iOS state restoration: a cancelled leftover no longer tears down the

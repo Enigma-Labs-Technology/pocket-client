@@ -17,6 +17,13 @@ Package.resolved
 *.aac
 *.caf
 !Tests/PocketClientTests/Fixtures/golden.mp3
+# The CLI writes downloads to `.<timestamp>.mp3.partial-<uuid>` and renames on
+# completion. The extension is not last, so `*.mp3` above does not match it —
+# a partial download of somebody's voice would otherwise be committable, and one
+# was found at the package root after a hardware test.
+.*.partial-*
+*.partial
+
 
 # Packet captures and device logs (they carry the session key in cleartext —
 # the protocol is plain ASCII)

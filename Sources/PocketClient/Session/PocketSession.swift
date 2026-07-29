@@ -26,6 +26,22 @@ public actor PocketSession {
     /// nobody would be left to resume it — the slot would wedge forever).
     private var latestExpiredGeneration = 0
 
+    /// What this session's key implies the device's Wi-Fi AP password should
+    /// be: the key's first `WiFiJoinDiagnosis.passphraseLength` characters, the
+    /// derivation recorded in `docs/protocol/ble-protocol.md`. `nil` when the
+    /// key is too short for that derivation to say anything — real keys are
+    /// `PocketKey.length`, so only a hand-made short one lands there.
+    ///
+    /// Internal, and deliberately this narrow rather than exposing the key:
+    /// the WiFi transfer compares it against the password the device reports
+    /// in order to say *where* a failed join went wrong (see
+    /// `WiFiJoinDiagnosis`). That is the only reason any part of the key leaves
+    /// this file, and neither value is ever logged or put in an error message.
+    var apPassphraseImpliedByKey: String? {
+        guard sessionKey.count >= WiFiJoinDiagnosis.passphraseLength else { return nil }
+        return String(sessionKey.prefix(WiFiJoinDiagnosis.passphraseLength))
+    }
+
     /// Events buffer bound. Events are current-state signals (recording
     /// markers, link loss, observational frames) with no replay value once
     /// stale, so the stream keeps only the newest 64 — comfortably above the

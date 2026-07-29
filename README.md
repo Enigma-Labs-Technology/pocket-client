@@ -189,6 +189,13 @@ first 8 characters, which is the only readable part of a key.
 > first 8 characters, so a key you lose is a device you can no longer talk to
 > through this package. Store it before you continue.
 
+**A rebind also invalidates the device's Wi-Fi AP password**, because the
+password is the key's first 8 characters and follows the live binding (verified
+on hardware). The SSID does not change with it, so every Mac and phone that has
+joined that AP before keeps offering the old password and fails — and no app can
+clear a network the user saved. Whoever rotates a key has to forget the network
+by hand on each host: see [When the join fails](#when-the-join-fails).
+
 **Undoing a rebind is not something this package can do.** Re-adoption runs
 through the vendor app's "unregistered-device recovery" path, which uses a
 Remote-Config fallback master key and needs the *original account's* app
@@ -238,6 +245,7 @@ the index.
 | `APP&STA` **starts** a recording | It is one letter from `APP&STE`, which *queries*. `Command` keeps them as distinct cases so a method can never drift onto the wrong string. | [6 · Control recording](#6--control-recording) |
 | No unsolicited stop event | Stopping on the device sends **nothing**. `MCU&STO` exists only as the reply to a remote `APP&STO`. To notice a stop you must poll `isRecording()`. | [8 · Watch for events](#8--watch-for-events) |
 | `MCU&RT` is one-shot | It fires once at connect when a recording is already running, and **never repeats**. Nothing on the wire advances elapsed time; any UI clock must run locally from that anchor. | [8 · Watch for events](#8--watch-for-events) |
+| Rotating the key breaks saved Wi-Fi | The AP password is the session key's first 8 characters and follows the live binding, but the SSID is the BLE name and does not change. Every host that joined before the rotation keeps offering the old password and fails, and **no app can clear a user-saved network** — it must be forgotten by hand. | [When the join fails](#when-the-join-fails) |
 | Ten bytes past the end | A Wi-Fi transfer's TCP stream carries a short trailer (10 bytes observed) past the announced length. The announced count is authoritative; drain-to-EOF overshoots and fails an exact-length check. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
 | `APP&SHUT` may never answer | On an idle device there is **no** `MCU&SHUT`. Blocking on the reply hangs the happy path. | [12 · Go below the session](#12--go-below-the-session) |
 | `APP&U&WIFI` is a modifier | It reroutes the upload already selected by `APP&U&<date>&<ts>` to the TCP socket. Sent alone it has nothing to reroute. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
@@ -722,7 +730,7 @@ sequenceDiagram
     A->>B: APP&WIFIC ×2
 ```
 
-Three things in that flow bite:
+Four things in that flow bite:
 
 1. **`APP&WIFIO` is what starts the AP.** Querying credentials does not. A
    `WIFIS` poll between the credentials query and `WIFIO` still returns `0`.
@@ -741,6 +749,13 @@ Three things in that flow bite:
    which is precisely how the trailer was discovered. This package surfaces the
    surplus as `DeviceEvent.wifiTrailerReceived(byteCount:preview:)` and never
    lets it reach the file.
+4. **Rotating the session key rotates the AP password.** The password follows
+   the *live* binding — verified on hardware after an `adopt`, where the device
+   reported the new key's first 8 characters — but the SSID does not change with
+   it, because the SSID **is** the BLE name. So every Mac and phone that has
+   joined the AP before now holds a stale credential, keeps offering it silently,
+   and fails. See [When the join fails](#when-the-join-fails); this is the
+   sharpest edge in the whole flow, because no app can clear it.
 
 The Wi-Fi state machine is worth reading twice, because the numbers do not
 ascend with progress:
@@ -770,7 +785,7 @@ public protocol HotspotJoining: Sendable {
 | Implementation | Platform | Behaviour | Evidence |
 |---|---|---|---|
 | `SystemHotspotJoiner` (default) | iOS | Joins programmatically via `NEHotspotConfiguration` with `joinOnce = true`. Requires the Hotspot Configuration entitlement **in the consuming app**, not in this package. Treats `alreadyAssociated` as success, so a half-failed earlier attempt does not silently degrade `.auto` to BLE. On macOS it throws `PocketError.wifiJoinFailed` naming the SSID and password. | `compile-only` on iOS |
-| `ManualHotspotJoiner` | macOS | Prints the SSID and password, blocks on `readLine()` until the operator joins in System Settings and presses return, then runs the transfer. Afterwards it says the operator may rejoin their normal network. | `hardware` |
+| `ManualHotspotJoiner` | macOS | Prints the SSID and password, blocks on `readLine()` until the operator joins in System Settings and presses return, then runs the transfer. Afterwards it says the operator may rejoin their normal network. It also warns that a Mac which joined this AP before a key rotation will silently reuse the old password — printing the right one is [demonstrably not enough](#when-the-join-fails). | `hardware` |
 
 ```swift
 // macOS harness
@@ -820,6 +835,60 @@ surfaced as `DeviceEvent.wifiReadinessNotObserved` rather than raised as an
 error. A firmware whose state machine differs from the capture should not be
 blocked from a transfer that would have worked — but it should not do it
 silently either.
+
+### When the join fails
+
+**Evidence:** `hardware` for the cause (observed 2026-07-28 on a rebound device,
+on both iOS and macOS); `hardware` for the AP password following the live
+binding; `compile-only` for the iOS join that reports it.
+
+> [!IMPORTANT]
+> **Rotating the session key invalidates the AP password on every host that has
+> ever joined.** The AP password is the key's first 8 characters and it tracks
+> the *current* binding, so `adopt` changes it — while the SSID, which is the BLE
+> name, stays the same. A Mac or iPhone that joined before the rotation matches
+> the network by name, silently offers the password it remembers, and fails.
+
+The OS tells you almost nothing about this. iOS raises the system alert *"Unable
+to join the network PKT01_…"*; macOS, where the join is manual, raises no join
+error at all — the transfer simply fails later with
+`wifi tcp connect timed out after 30.0 seconds`, because nothing ever associated
+with the AP. **Neither message distinguishes a stale saved password from an
+access point that is down.** Isolating it on hardware took three separate probes.
+
+So the package says what the OS will not. It holds the session key, and the AP
+password is documented to be its first 8 characters — so it can compare the key
+against the password the device just reported over BLE and state whether the
+*device* is self-consistent:
+
+| What the comparison shows | What the thrown error says |
+|---|---|
+| The reported password **is** what the key implies | The device's own credentials are current, so the credentials handed to the OS were right and what remains is this host's saved network. |
+| The reported password is **not** what the key implies | Reported as a firmware finding, explicitly *not* as this failure's cause: the join used the device's value, which is authoritative. Never an error in its own right. |
+| The key is shorter than the password | Says so, and claims nothing. (Real keys are 16 characters; only a hand-made short one gets here.) |
+
+Both shapes of the failure carry it — the join error, and a TCP connect that
+fails while the device reported **no** client on its AP (`APP&WIFIS` returning
+`3` and never `2`, which is the macOS shape). When the device *did* report an
+associated client, the message is left alone: the host is demonstrably on the AP,
+so cached credentials are not the story.
+
+Neither password appears in the message, so a failure stays safe to paste into a
+bug report.
+
+**The repair is manual, and that is not an oversight.**
+`NEHotspotConfigurationManager.removeConfiguration(forSSID:)` removes only
+configurations your app applied; neither iOS nor macOS exposes an API that can
+remove a network the *user* saved. The person has to forget it by hand — macOS:
+System Settings > Wi-Fi > Advanced…, Known Networks; iOS: Settings > Wi-Fi > the
+network's info button > Forget This Network. `ManualHotspotJoiner` warns about it
+up front, before the operator joins, because that is the only cheap moment.
+
+> [!WARNING]
+> **Do not work around this by minting rotated keys that keep the first eight
+> characters.** It would hold the AP password stable and avoid the problem
+> entirely — and those eight characters are the credential you are rotating away
+> from. Keeping them leaves the old secret opening the access point.
 
 ### Empty recordings
 
@@ -1017,6 +1086,12 @@ Wi-Fi AP password; weak randomness here would weaken both. The space is
 Binding a key to a device is a CLI operation, not a library one — see
 [`pocket-cli adopt`](#pocket-cli--the-hardware-harness).
 
+Rotating a key has one consequence that lands outside this package: the Wi-Fi AP
+password rotates with it, and every host that has joined the AP before must
+forget the network by hand before Wi-Fi transfers work again. Read
+[When the join fails](#when-the-join-fails) before you rotate a key on a device
+you sync over Wi-Fi.
+
 ### `SessionKeyStore` — opt-in Keychain persistence
 
 The package itself never persists the session key. An app that wants "pair once,
@@ -1186,8 +1261,8 @@ public enum PocketError: Error, Equatable {
 | `.emptyRecording` | A 0-second recording. Nothing to download; not a transport failure. |
 | `.deviceNotFound` | `connect(to:)` was given an identifier this system has never seen, or has forgotten (e.g. after a factory reset). Re-scan. |
 | `.busy` | One connection and one transfer at a time. The string says which guard fired. |
-| `.wifiJoinFailed` | The hotspot join failed, or `SystemHotspotJoiner` was used on macOS. |
-| `.transferFailed` | Carries a diagnostic string: GATT write failure, TCP connect failure, a stall, a disk error while streaming to a file. |
+| `.wifiJoinFailed` | The hotspot join failed, or `SystemHotspotJoiner` was used on macOS. The detail leads with the joiner's own text and then names the likeliest cause — usually a stale saved password left behind by a key rotation. See [When the join fails](#when-the-join-fails). |
+| `.transferFailed` | Carries a diagnostic string: GATT write failure, TCP connect failure, a stall, a disk error while streaming to a file. A TCP connect that failed while the device reported **no** client on its AP says so, and carries the same stale-credential diagnosis. |
 | `.disconnected` | The link dropped, was never established, or the instance is spent. |
 
 `pocket-cli` prints one line of triage per failure mode from this same table —
@@ -1544,6 +1619,9 @@ record start/stop, and live audio, all replayed from vendor-app btsnoop captures
 and confirmed by live probing. BLE and Wi-Fi downloads, verified
 **byte-identical** to a reference capture of the same recording. Rebinding to a
 self-generated key (`adopt`) and the guarded wipe (`reset`), both run end to end.
+The Wi-Fi AP password **follows the live binding**: after a rebind the device
+reported the new key's first 8 characters, surviving the reset and the reboot
+(2026-07-28, one device).
 
 **`probed`** — `APP&PAU` / `APP&RESU` answer `MCU&UNKNOWN` on firmware 1.7, so
 there is no pause/resume API. A negative result is still a result.

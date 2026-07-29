@@ -245,11 +245,18 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
     let session = PocketSession(transport: t, sessionKey: "K")
     try await session.start()
 
-    await #expect(throws: PocketError.wifiJoinFailed("test")) {
+    // The joiner's own text still leads the message; the diagnosis (asserted on
+    // in its own tests below) is appended to it.
+    var detail: String?
+    do {
         _ = try await session.downloadOverWiFi(recording,
                                                endpointOverride: nil,
                                                joiner: RecordingJoiner(shouldFail: true))
+        Issue.record("expected the join to fail")
+    } catch PocketError.wifiJoinFailed(let thrown) {
+        detail = thrown
     }
+    #expect(detail?.hasPrefix("test — ") == true)
     // The AP was started (WIFIO went out) before the join could fail …
     #expect(t.sent.contains("APP&WIFIO"))
     // … so the failure closed it (best effort) instead of leaving it
@@ -293,9 +300,14 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
                               joiner: RecordingJoiner(shouldFail: true))
     try await device.connect()
 
-    await #expect(throws: PocketError.wifiJoinFailed("test")) {
+    var detail: String?
+    do {
         _ = try await device.download(recording, via: .wifi)
+        Issue.record("expected the join failure to surface")
+    } catch PocketError.wifiJoinFailed(let thrown) {
+        detail = thrown
     }
+    #expect(detail?.hasPrefix("test — ") == true)
     // No BLE download was attempted.
     #expect(!t.sent.contains("APP&U&2026-01-04&20260104101500"))
     await device.disconnect()
@@ -491,5 +503,176 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
     // The failure path released the exclusive transfer slot.
     try await session.beginTransfer()
     await session.endTransfer()
+    await session.stop()
+}
+
+// MARK: - A failed join names its own most likely cause
+//
+// Rotating the session key rotates the AP password with it (VERIFIED on
+// hardware 2026-07-28), so every host that has joined the AP before holds a
+// stale credential — and both platforms report that as "unable to join", which
+// is indistinguishable from the AP being down. These tests pin the one thing
+// the package can add: the session key implies the AP password, so it can say
+// whether the *device* is self-consistent.
+
+/// The scripted device reports `ExampleK`; this key implies exactly that.
+private let matchingKey = "ExampleKey000000"
+/// 16 chars, and its first 8 (`RotatedK`) are NOT what the device reports.
+private let disagreeingKey = "RotatedKey000000"
+
+/// Nothing listens on port 1, so a connect there refuses immediately.
+private let deadEndpoint = NWEndpoint.hostPort(host: "127.0.0.1",
+                                               port: NWEndpoint.Port(rawValue: 1)!)
+
+/// Readiness short enough that the association wait and the TCP connect both
+/// resolve inside a test run.
+private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
+                                           pollInterval: .milliseconds(5),
+                                           pingInterval: .seconds(60))
+
+@Test func theDiagnosisComparesTheReportedPasswordAgainstWhatTheKeyImplies() {
+    #expect(WiFiJoinDiagnosis.of(reportedPassphrase: "ExampleK", derivedFromKey: "ExampleK")
+            == .deviceCredentialsCurrent)
+    #expect(WiFiJoinDiagnosis.of(reportedPassphrase: "ExampleK", derivedFromKey: "RotatedK")
+            == .reportedPassphraseDiffers)
+    // No key long enough to derive from: no comparison, and no pretending.
+    #expect(WiFiJoinDiagnosis.of(reportedPassphrase: "ExampleK", derivedFromKey: nil)
+            == .notComparable)
+
+    // Each verdict must read differently — being able to tell them apart is the
+    // entire point — and every one of them must name the manual repair, which
+    // is the only repair there is.
+    let texts = WiFiJoinDiagnosis.allCases.map { $0.guidance(ssid: "PKT01_EXAMPLE") }
+    #expect(Set(texts).count == WiFiJoinDiagnosis.allCases.count)
+    #expect(texts.allSatisfy { $0.contains("Forget PKT01_EXAMPLE in Wi-Fi settings") })
+    #expect(texts.allSatisfy { $0.contains("Neither iOS nor macOS exposes an API") })
+}
+
+/// The key-derived password is `key[:8]`, and a key too short to derive from
+/// yields nil rather than a comparison that would mean nothing.
+@Test func theKeyImpliedAPPasswordIsTheFirstEightCharactersOfTheKey() async {
+    let real = PocketSession(transport: FakeTransport(), sessionKey: matchingKey)
+    #expect(await real.apPassphraseImpliedByKey == "ExampleK")
+    let tooShort = PocketSession(transport: FakeTransport(), sessionKey: "K")
+    #expect(await tooShort.apPassphraseImpliedByKey == nil)
+}
+
+/// PSK matches the key: the device is self-consistent, so the error says the
+/// fault is this host's saved network — a much stronger statement than
+/// "join failed".
+@Test func aJoinFailureWithMatchingCredentialsBlamesTheHostsSavedNetwork() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    t.script["APP&WIFIS"] = ["MCU&WIFIS&0"]
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: nil,
+                                               joiner: RecordingJoiner(shouldFail: true))
+        Issue.record("expected the join to fail")
+    } catch PocketError.wifiJoinFailed(let thrown) {
+        detail = thrown
+    }
+
+    #expect(detail.hasPrefix("test — "))   // the joiner's own text survives
+    #expect(detail.contains("exactly what this session's key implies"))
+    #expect(detail.contains("so the device's own credentials are current"))
+    #expect(detail.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+    // No credential is ever in the message: it must stay safe to paste into a
+    // bug report.
+    #expect(!detail.contains("ExampleK"))
+    await session.stop()
+}
+
+/// PSK does not match the key. That is a finding about the firmware, NOT an
+/// error and not this failure's cause: the join used the device's value, the
+/// flow is unchanged, and the message says so instead of claiming the
+/// credentials were confirmed.
+@Test func aJoinFailureWithADisagreeingPasswordReportsItWithoutTreatingItAsTheFault() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(disagreeingKey)"] = ["MCU&SK&OK"]
+    t.script["APP&WIFIS"] = ["MCU&WIFIS&0"]
+    let session = PocketSession(transport: t, sessionKey: disagreeingKey)
+    try await session.start()
+
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: nil,
+                                               joiner: RecordingJoiner(shouldFail: true))
+        Issue.record("expected the join to fail")
+    } catch PocketError.wifiJoinFailed(let thrown) {
+        detail = thrown
+    }
+
+    #expect(detail.hasPrefix("test — "))
+    #expect(detail.contains("is not this session key's first 8 characters"))
+    #expect(detail.contains("the join used the device's value, which is authoritative"))
+    #expect(detail.contains("a firmware finding to record, not this failure's cause"))
+    // Distinct guidance from the matching case — that is what makes it a
+    // diagnosis rather than decoration.
+    #expect(!detail.contains("exactly what this session's key implies"))
+    // Still just a join failure, with the same repair offered.
+    #expect(detail.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+    await session.stop()
+}
+
+/// The macOS shape of the failure: the join cannot fail (the operator pressed
+/// return), nothing associated, and the only symptom is a socket that never
+/// opens. The device is the witness — it reported no client — so the connect
+/// error carries the diagnosis too.
+@Test func aConnectFailureWithNoReportedAssociationNamesTheStaleCredential() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    t.script["APP&WIFIS"] = ["MCU&WIFIS&3"]   // AP up, never a client
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+
+    let joiner = RecordingJoiner(shouldFail: false)
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: deadEndpoint,
+                                               joiner: joiner, readiness: briefReadiness)
+        Issue.record("expected the TCP connect to fail")
+    } catch PocketError.transferFailed(let thrown) {
+        detail = thrown
+    }
+
+    #expect(detail.contains("wifi tcp connect"))   // the original symptom is kept
+    #expect(detail.contains("the device never reported a client on its AP (no MCU&WIFIS&2)"))
+    #expect(detail.contains("nothing joined PKT01_EXAMPLE"))
+    #expect(detail.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+    #expect(joiner.box.left == 1)   // the AP was still left on the failure path
+    await session.stop()
+}
+
+/// The counterpart, and the reason the check is conditioned: when the device
+/// DID report an associated client the host is demonstrably on the AP, so
+/// cached credentials are not the story and the message stays as it was.
+@Test func aConnectFailureAfterAnObservedAssociationIsNotBlamedOnSavedCredentials() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    scriptWIFIStateMachine(on: t, apUpPolls: 0)   // reaches MCU&WIFIS&2
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: deadEndpoint,
+                                               joiner: RecordingJoiner(shouldFail: false),
+                                               readiness: briefReadiness)
+        Issue.record("expected the TCP connect to fail")
+    } catch PocketError.transferFailed(let thrown) {
+        detail = thrown
+    }
+
+    #expect(detail.contains("wifi tcp connect"))
+    #expect(!detail.contains("never reported a client on its AP"))
+    #expect(!detail.contains("Forget"))
     await session.stop()
 }

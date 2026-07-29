@@ -102,6 +102,11 @@ explore it on a device you care about.
 Verification that a new key took: `APP&WIFI` returns the AP password, which is `key[:8]` — the
 only read-back of any part of the key. The old key should then answer `MCU&SK&ERR`.
 
+That read-back is not merely a check: the AP password really does rotate with the binding, which
+invalidates the saved Wi-Fi credential on every host that has joined the device's AP before. See
+[A rebind propagates to the AP password](#a-rebind-propagates-to-the-ap-password-verified-on-hardware-2026-07-29)
+— that consequence, not the rebind itself, is what breaks Wi-Fi transfers after a rotation.
+
 Reversibility: the vendor app carries an "unregistered-device recovery" path using a
 Remote-Config **fallback master key**, so rebinding is not cryptographically one-way. Re-adoption
 needs the *original* account's app running near the device with that flag enabled, so a stranger's
@@ -253,6 +258,58 @@ from a single sample.
 bytes and ignore any surplus. A client that drains the socket until EOF will
 overshoot and fail an exact-length integrity check (this is precisely how the
 trailer was discovered).
+
+### A rebind propagates to the AP password (VERIFIED on hardware 2026-07-29)
+
+Step 3 above records *what* the AP password is (`key[:8]`) but said nothing
+about *when* it is derived, and nobody had previously rebound a device and then
+used Wi-Fi on it. That combination is now verified: the password tracks the
+**live binding**, and the change survives both the `APP&BLE&RESET` and the
+reboot a rebind requires.
+
+Evidence, on `PKT01_EXAMPLE` after `APP&BLE&RESET` followed by adopting a
+locally generated key:
+
+1. `pocket-cli probe` — the BLE handshake succeeded with the new key in 180 ms,
+   so the rebind held.
+2. `pocket-cli raw WIFI` — the device answered `MCU&WIFI&PKT01_EXAMPLE&<psk>`
+   where `<psk>` was the **new** key's first 8 characters, not the old key's. So
+   the rebind propagated all the way into the Wi-Fi subsystem.
+3. `pocket-cli download … wifi` — the AP came up and broadcast under the right
+   name, and BLE stayed alive throughout (an `MCU&WPING` arrived mid-attempt).
+
+**The consequence is the operationally important part: every device that has
+ever joined that AP now holds a stale credential.** The SSID does not change
+with the password — it *is* the BLE name (step 3) — so a Mac or phone that
+joined before the rotation still matches the network by name, silently offers
+the password it remembers, and fails. The failure was observed on both hosts of
+the session above: iOS raised the system alert *"Unable to join the network
+PKT01_…"*, and macOS (where the join is manual) produced no join error at all —
+only `wifi tcp connect timed out after 30.0 seconds`, because nothing ever
+associated with the AP. **Neither message distinguishes a stale credential from
+an access point that is down**, and that ambiguity is what made this take the
+three probes above to isolate. The device is the only witness that can tell them
+apart: `APP&WIFIS` returning `3` and never `2` means the AP is up and nothing
+joined it.
+
+**An app cannot repair it.**
+`NEHotspotConfigurationManager.removeConfiguration(forSSID:)` removes only
+configurations the app itself created; neither iOS nor macOS exposes any API
+that can remove a network the *user* saved. The person has to forget the network
+by hand — macOS: System Settings > Wi-Fi > Advanced…, Known Networks; iOS:
+Settings > Wi-Fi > the network's info button > Forget This Network.
+
+**Nor can the SSID be changed to sidestep it.** The SSID is the BLE name (step
+3), and the only SSID-bearing command in this protocol is the FORBIDDEN
+`APP&WIFI&CH&<ssid>&<psk>` — which provisions the device onto a home network as
+a *client*. It does not rename the device's own AP, so there is no supported way
+to give a rotated key a fresh SSID and leave the stale entry harmless.
+
+**Do not "solve" this by generating rotated keys that preserve the first eight
+characters.** It would hold the AP password stable and avoid the problem
+entirely, and it is a **bad idea**: those eight characters are precisely the
+credential being rotated away from. Holding them stable leaves the old secret
+opening the access point, which is most of what the rotation was for.
 
 Security note: SK is the root secret for both BLE auth and the Wi-Fi AP password —
 anyone holding SK can join the AP and pull every recording.

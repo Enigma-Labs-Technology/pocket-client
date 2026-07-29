@@ -78,12 +78,24 @@ public final class SystemHotspotJoiner: HotspotJoining, @unchecked Sendable {
 public struct ManualHotspotJoiner: HotspotJoining {
     public init() {}
     public func join(ssid: String, passphrase: String) async throws {
+        // Step 2's warning is not hypothetical: on 2026-07-28 this path printed
+        // the correct post-rotation password and the operator still joined with
+        // the one the Mac remembered, because macOS matches a known network by
+        // SSID and never asks again. The AP password follows the session key
+        // (`key[:8]`), so every rotation invalidates it on every host that has
+        // joined before — and the only symptom reaching this process was a TCP
+        // connect that timed out.
         print("""
 
         ACTION REQUIRED — the recorder's WiFi access point is now up.
           1. Open System Settings > Wi-Fi on THIS Mac.
           2. Join the network named:  \(ssid)
              using the password:      \(passphrase)
+             If this Mac has joined \(ssid) before AND the device's session key
+             has been rotated since, macOS will silently reuse the OLD password
+             and report only that it cannot join. Forget the network first —
+             System Settings > Wi-Fi > Advanced…, Known Networks — then join
+             with the password above.
           3. Once connected, come back here and press return to start the transfer.
         (Bluetooth control stays up; only the file bytes travel over WiFi.)
         waiting for return…
@@ -93,6 +105,82 @@ public struct ManualHotspotJoiner: HotspotJoining {
     public func leave() async {
         // Runs on failure paths too, so it must not claim success.
         print("wifi step finished — you may rejoin your normal WiFi network now")
+    }
+}
+
+/// What this package can say about a failed access-point join that the OS will
+/// not say.
+///
+/// Both platforms report a join failure as one opaque line — iOS as the system
+/// alert *"Unable to join the network <ssid>"*, macOS (where the join is
+/// manual) as nothing at all, just a TCP connect that never completes. Neither
+/// distinguishes a wrong password from an access point that is down, and on
+/// 2026-07-28 that ambiguity took three hardware probes to resolve.
+///
+/// The package holds one fact the OS does not: the session key. The AP password
+/// is the key's first `passphraseLength` characters
+/// (`docs/protocol/ble-protocol.md`, Wi-Fi Quick Transfer step 3), and a rebind
+/// propagates into it — VERIFIED on hardware. So comparing the key against the
+/// password the device just reported over BLE settles whether the *device* is
+/// self-consistent, and that is what decides where to look next: if it is, the
+/// credentials offered to the OS were right and the fault is on this host.
+///
+/// Neither password appears in the guidance text. The reported one is a live
+/// credential and the derived one is eight characters of the session key, so
+/// the copy states only whether they agree — which keeps the error safe to
+/// paste into a bug report.
+enum WiFiJoinDiagnosis: Equatable, Sendable, CaseIterable {
+    /// The device's reported AP password is exactly what this session's key
+    /// implies. The device is self-consistent, so the credentials handed to the
+    /// OS were correct and what remains is this host: in practice a saved
+    /// network still holding the pre-rotation password.
+    case deviceCredentialsCurrent
+    /// The device reported a password that is **not** this key's first
+    /// `passphraseLength` characters. Informative, never an error: the join used
+    /// the device's value, which is authoritative, and the disagreement is a
+    /// finding about this firmware's derivation rather than this failure's cause.
+    case reportedPassphraseDiffers
+    /// No comparison was possible — this session's key is shorter than the
+    /// password itself. Real keys are `PocketKey.length`; only a hand-made
+    /// short key reaches this.
+    case notComparable
+
+    /// The documented derivation: AP password = the session key's first 8 chars.
+    static let passphraseLength = 8
+
+    static func of(reportedPassphrase: String, derivedFromKey: String?) -> WiFiJoinDiagnosis {
+        guard let derivedFromKey else { return .notComparable }
+        return reportedPassphrase == derivedFromKey
+            ? .deviceCredentialsCurrent
+            : .reportedPassphraseDiffers
+    }
+
+    /// Reads after the failure text, in the register the rest of the package
+    /// uses: what is known, then what to do about it.
+    func guidance(ssid: String) -> String {
+        // Shared tail — the repair is the same whatever the comparison said,
+        // and it is the only repair there is.
+        let hostSideRepair =
+            "A password this host saved for \(ssid) before the session key was rotated is the "
+            + "likely cause: the OS re-offers it silently and reports only that it cannot join. "
+            + "Forget \(ssid) in Wi-Fi settings — macOS: System Settings > Wi-Fi > Advanced…, "
+            + "Known Networks; iOS: Settings > Wi-Fi > the network's info button > Forget This "
+            + "Network — then run this again. Neither iOS nor macOS exposes an API that can "
+            + "remove a network the user saved, so nothing here can do it for you."
+        switch self {
+        case .deviceCredentialsCurrent:
+            return "the AP password the device reported is exactly what this session's key "
+                + "implies, so the device's own credentials are current. " + hostSideRepair
+        case .reportedPassphraseDiffers:
+            return "the AP password the device reported is not this session key's first "
+                + "\(Self.passphraseLength) characters, which is the documented derivation — the "
+                + "join used the device's value, which is authoritative, so that disagreement is "
+                + "a firmware finding to record, not this failure's cause. " + hostSideRepair
+        case .notComparable:
+            return "this session's key is shorter than the \(Self.passphraseLength)-character AP "
+                + "password, so the reported password could not be checked against it. "
+                + hostSideRepair
+        }
     }
 }
 
@@ -448,7 +536,7 @@ extension PocketSession {
             try await joiner.join(ssid: ssid, passphrase: passphrase)
         } catch {
             try? await send(.wifiClose)
-            throw error
+            throw diagnosed(joinFailure: error, ssid: ssid, passphrase: passphrase)
         }
         // From here every exit must also leave the AP so the operator's
         // normal network comes back. `leave()` is async, so a defer cannot
@@ -469,8 +557,14 @@ extension PocketSession {
             }
             // 6. TCP first — the selection that follows is served into this
             // socket, and the device reports it as MCU&WIFIS&1.
-            let connection = try await connectKeepingLinkAlive(
-                to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness)
+            let connection: NWConnection
+            do {
+                connection = try await connectKeepingLinkAlive(
+                    to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness)
+            } catch {
+                throw diagnosed(connectFailure: error, ssid: ssid, passphrase: passphrase,
+                                clientAssociationObserved: observedJoin)
+            }
             do {
                 let data = try await transferOverTCP(recording, connection: connection,
                                                      sink: sink,
@@ -490,6 +584,51 @@ extension PocketSession {
             await joiner.leave()
             throw error
         }
+    }
+
+    /// The comparison behind every message below: the password the device just
+    /// reported over BLE against the one this session's key implies.
+    private func wifiJoinDiagnosis(reportedPassphrase: String) -> WiFiJoinDiagnosis {
+        .of(reportedPassphrase: reportedPassphrase, derivedFromKey: apPassphraseImpliedByKey)
+    }
+
+    /// Appends this package's own diagnosis to a join failure, so the thrown
+    /// error names the likeliest cause instead of only the symptom. A stale
+    /// saved credential is a known, common cause — it happens to *everyone* who
+    /// rotates a key — and is invisible from the OS's API surface.
+    ///
+    /// Only `PocketError.wifiJoinFailed` is rewritten: both built-in joiners
+    /// throw it and it is the documented shape, while a custom joiner's own
+    /// error type — and `CancellationError` — propagates untouched rather than
+    /// being flattened into a string. The joiner's original text still leads;
+    /// the diagnosis follows it.
+    private func diagnosed(joinFailure error: Error, ssid: String, passphrase: String) -> Error {
+        guard case PocketError.wifiJoinFailed(let detail) = error else { return error }
+        return PocketError.wifiJoinFailed(
+            "\(detail) — \(wifiJoinDiagnosis(reportedPassphrase: passphrase).guidance(ssid: ssid))")
+    }
+
+    /// A TCP connect that fails while the device never reported a client on its
+    /// AP is the shape this failure takes on the macOS path, where the join
+    /// cannot fail: the operator pressed return, nothing associated, and the
+    /// only symptom reaching the process is a socket that never opens
+    /// (`wifi tcp connect timed out after 30.0 seconds`, on 2026-07-28). The
+    /// device is the witness here — it says whether *any* client ever
+    /// associated with the AP it was broadcasting — so the guidance is added
+    /// only when it saw none. When the association *was* observed the text is
+    /// left alone: the host is demonstrably on the AP, so cached credentials
+    /// are not the story and saying otherwise would be noise.
+    ///
+    /// Message only. The error case, the control flow, and the AP teardown are
+    /// unchanged, and `CancellationError` passes through untouched.
+    private func diagnosed(connectFailure error: Error, ssid: String, passphrase: String,
+                           clientAssociationObserved: Bool) -> Error {
+        guard !clientAssociationObserved,
+              case PocketError.transferFailed(let detail) = error else { return error }
+        return PocketError.transferFailed(
+            "\(detail) — the device never reported a client on its AP (no MCU&WIFIS&2), so nothing "
+            + "joined \(ssid): "
+            + wifiJoinDiagnosis(reportedPassphrase: passphrase).guidance(ssid: ssid))
     }
 
     /// Polls `APP&WIFIS` until the device reports `.clientJoined` (2) — or
