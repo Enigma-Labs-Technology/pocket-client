@@ -11,7 +11,7 @@ firmware version, and a firmware update can invalidate any of them — so the AP
 may still have to change to match what the hardware turns out to do. Read the
 notes for a release before upgrading.
 
-## [Unreleased]
+## [0.1.5] — 2026-07-30
 
 ### Changed
 
@@ -580,5 +580,6 @@ these has kept nothing.
   authoritative and the surplus is ignored.
 - No dependencies. iOS 17+, macOS 14+, Swift 6 toolchain.
 
-[Unreleased]: https://github.com/Enigma-Labs-Technology/pocket-client/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/Enigma-Labs-Technology/pocket-client/compare/0.1.5...HEAD
+[0.1.5]: https://github.com/Enigma-Labs-Technology/pocket-client/compare/0.1.4...0.1.5
 [0.1.0]: https://github.com/Enigma-Labs-Technology/pocket-client/releases/tag/0.1.0
