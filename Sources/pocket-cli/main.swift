@@ -706,6 +706,13 @@ do {
                 print("trailer after file: \(byteCount) bytes: " +
                       "\(hexPrefix(preview, count: preview.count)) " +
                       "\"\(asciiPreview(preview))\"\(truncated)")
+            case .wifiConnectPath(let line):
+                // Which interface the connect required of itself, and — on a
+                // failure — every NWConnection state it went through, each
+                // `.waiting` with the reason the framework attached to it. This
+                // IS the diagnosis for a Wi-Fi transfer that will not connect, so
+                // it is wrapped as prose rather than run off the terminal's edge.
+                print(wrappedForTranscript(line, indent: "  "))
             default:
                 print("[event] \(event)")
             }

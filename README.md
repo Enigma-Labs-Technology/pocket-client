@@ -946,18 +946,24 @@ against the password the device just reported over BLE and state whether the
 Neither password appears in the message, so a failure stays safe to paste into a
 bug report.
 
-**The credential story is told only where the device's report supports it.** The
-join error always carries it. A TCP connect that never completes carries it only
-when the device reported its AP up with nothing ever on it (`APP&WIFIS` returning
-`3` and never `2`) — the shape a stale password makes. The other two shapes get
-their own text, because a diagnosis that confidently names the wrong cause is
-worse than a bare error:
+**The credential story is told only where the evidence supports it.** The join
+error always carries it. A TCP connect that never completes carries it only where
+this host holds no address on the recorder's subnet — the shape a silently
+rejected join makes. Everything else gets its own text, because a diagnosis that
+confidently names the wrong cause is worse than a bare error:
 
-| What the device reported during setup | What a failed TCP connect says |
+| What the evidence shows | What a failed TCP connect says |
 |---|---|
-| A client on its AP (`MCU&WIFIS&2`, or `1`) | The host **was** associated and its credentials **were** accepted, so the password is not in question. Points at [the access point's lifetime](#the-access-point-does-not-wait-for-you) instead. |
-| Its Wi-Fi **off** (`MCU&WIFIS&0`) | The access point came down by itself before anything could connect. Also a lifetime problem, and explicitly not a credential this host holds. |
-| The AP up, nothing on it (`MCU&WIFIS&3`) | The stale-credential guidance above, and the manual repair. |
+| No interface on this host holds an address on the device's `/24` | This **host** is not on the AP, whatever the device reported. Names the SSID to join, plus the stale-credential repair below. The connect is not attempted at all. |
+| An interface does, and the device reported its Wi-Fi **off** | The access point came down by itself before anything could connect. Explicitly not a credential this host holds — see [the access point's lifetime](#the-access-point-does-not-wait-for-you). |
+| An interface does, and the AP is still up | The association and the credentials are settled, and so is the AP's lifetime — a device that had closed its AP would not still be leasing the address. Names the interface and quotes the reason `Network.framework` gave, or states that it gave none. |
+
+The interface evidence is preferred to `MCU&WIFIS` on purpose: the device reports
+`2` for **any** associated client, and hardware confirmed that a Mac auto-joining
+a remembered network satisfies that check while proving nothing about this
+process. Where the endpoint is overridden with something that is not an IPv4
+`host:port` there is no interface evidence, and the diagnosis falls back to
+reasoning from the device's report alone.
 
 **The repair is manual, and that is not an oversight.**
 `NEHotspotConfigurationManager.removeConfiguration(forSSID:)` removes only
@@ -1010,13 +1016,14 @@ before any joiner runs.
 > it extends the AP's lifetime rather than only holding the BLE session open has
 > never been measured. On 2026-07-29 a `sync-wifi` run reached `MCU&WIFIS&2` — the
 > device confirming the Mac had associated — and the TCP connect still timed out
-> after 30 s with this keepalive running throughout. Either the keepalive works and
-> something else is wrong (the device's listener on :8475, or this client's socket
-> code), or it does not and no scheduling of it can make a manual join work at
-> human speed. [`pocket-cli probe-ap-lifetime`](#probe-ap-lifetime--does-appwping-extend-the-access-point)
-> measures it directly, in two runs, without joining anything. Until both have been
-> run, treat the fix above as a fix to the BLE link's survival — which it
-> demonstrably is — and not as a proven fix to the access point's.
+> after 30 s with this keepalive running throughout.
+> [`pocket-cli probe-ap-lifetime`](#probe-ap-lifetime--does-appwping-extend-the-access-point)
+> then measured the lifetime directly, without joining anything: **~59 s
+> unassisted, still up at the 180 s cap with `APP&WPING` every 10 s.** So the
+> keepalive does hold the access point, the AP was up during every failing
+> connect, and the lifetime is no longer a candidate cause. What remained was this
+> client's socket code — see
+> [the connect had to be told which interface to use](#the-connect-had-to-be-told-which-interface-to-use).
 
 **A blocking read has to leave the cooperative pool for that to be true.**
 `readLine()` blocks its thread for as long as the operator takes, and Swift
@@ -1030,6 +1037,63 @@ does not starve the pool.
 > Reduce what the join costs. Join the network once before the transfer if you can,
 > and if the Mac has joined this SSID before a key rotation, forget it *first* — the
 > stale-password prompt is what turns a fast join into a slow one.
+
+### The connect had to be told which interface to use
+
+**Evidence:** `unit` for both fixes; the macOS transfer they are meant to unblock
+is **not yet confirmed on hardware** — Alex runs that.
+
+Three causes were proposed for "every Wi-Fi transfer from a Mac fails with
+`wifi tcp connect timed out after 30.0 seconds`", and hardware eliminated all
+three: the credentials (the device reports `MCU&WIFIS&2`, so the host associated),
+the access point's lifetime (measured above), and the device's listener not
+existing (the capture shows the official app's SYN *preceding* its `APP&U&…`
+selection). Two defects in this client's socket code explain how the cause could
+be guessed at three times:
+
+**1. The diagnosis was being discarded.** `NWConnection`'s `.waiting(NWError)`
+carries the reason the path is not usable, and the connect's state handler threw
+it away:
+
+```swift
+default:
+    break   // .setup / .preparing / .waiting — keep waiting
+```
+
+A failing run could therefore only ever report its own timeout. Now every
+non-terminal state is recorded, the most recent `.waiting` reason goes into the
+thrown message — with its POSIX code, because `ENETDOWN (50)` is a path with no
+usable route while `EHOSTUNREACH (65)` is a route with nothing on the far end —
+and the whole transition sequence goes to `DeviceEvent.wifiConnectPath`, which
+`pocket-cli` prints. This has standalone value on every future failure whatever
+the cause turns out to be.
+
+**2. The connection named no interface.** `NWConnection(to: endpoint, using: .tcp)`
+uses default parameters, and `Network.framework` runs its own path evaluation
+rather than simply following the BSD route table. The recorder's AP provides no
+internet, and a Mac running a mesh VPN carries a `utun` holding a default route —
+so the framework can select, or wait indefinitely for, a path that cannot reach
+`192.168.200.1`. A silent 30 s timeout with no error delivered to the caller is
+the signature of exactly that. It is also why iOS worked and macOS did not: on iOS
+the app joins with `NEHotspotConfiguration`, so the path belongs to the process.
+
+The device's address is a fixed constant on a directly-connected `/24`, so this
+host's own address on that subnet identifies the right interface unambiguously.
+`getifaddrs` finds it, and the connection then **requires** that interface
+(`NWParameters.requiredInterface`) and prohibits the classes it provably is not.
+`requiredInterface` is the pin rather than `requiredLocalEndpoint` because that is
+what measurement showed to be enforced: a connection required to use `en0` while
+its destination is reachable only over loopback sits in
+`.waiting(POSIXErrorCode 50: Network is down)`, whereas `requiredLocalEndpoint`
+was ignored outright — including when the address it named belonged to no
+interface on the machine.
+
+Where no interface holds an address on that subnet, the host is not on the access
+point and the connect is not attempted: it says so at once and names the SSID to
+join, instead of spending 30 s finding out. The pre-flight allows a short bounded
+wait first, because on iOS `NEHotspotConfiguration.apply` returns on association —
+which can be before DHCP has handed the phone its address — and that path works
+today.
 
 ### Empty recordings
 
@@ -1149,6 +1213,7 @@ Task {
 | `.unmatchedResponse(String)` | The device sent a frame that satisfied no armed request matcher and is not a known unsolicited event — carried verbatim, `.unparsed` frames included. |
 | `.wifiTrailerReceived(byteCount:preview:)` | Surplus TCP bytes past a Wi-Fi transfer's announced length. `preview` is capped at 64 bytes. |
 | `.wifiReadinessNotObserved` | A Wi-Fi transfer proceeded without the device reporting a joined client. Diagnostic, not an error. |
+| `.wifiConnectPath(String)` | Which interface the Wi-Fi TCP connect required of itself and why, and — on a failure — every `NWConnection` state it passed through, each `.waiting` with the reason `Network.framework` attached to it. The verbose form of the connect diagnosis. |
 
 > [!WARNING]
 > **There is no unsolicited stop event, and `MCU&RT` is not a tick.**
@@ -1682,6 +1747,15 @@ out after 30 s with the keepalive running throughout, which leaves two readings:
   device's TCP listener on :8475, or this client's socket code.
 - `APP&WPING` **does not**, in which case a manual join cannot work at any human
   speed however the keepalive is scheduled.
+
+> [!NOTE]
+> **Answered, 2026-07-29: the first reading.** ~59 s unassisted, still up at the
+> 180 s cap with `--keepalive`. So AP lifetime does not cause the macOS failure —
+> and the listener is ruled out by the capture, which shows the vendor app's SYN
+> preceding its `APP&U&…` selection. What was left was this client's socket code:
+> [the connect had to be told which interface to use](#the-connect-had-to-be-told-which-interface-to-use).
+> The command remains the instrument for the AP's lifetime, which is worth
+> re-measuring against any firmware change.
 
 This command measures it, and the design is what makes the numbers trustworthy:
 it brings the access point up (`APP&WIFIO`), polls `APP&WIFIS` on a fixed cadence,

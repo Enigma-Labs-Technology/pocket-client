@@ -795,9 +795,10 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
                                                 pollInterval: .milliseconds(5),
                                                 pingInterval: .seconds(60))
 
-/// The stop reason must carry what the single-recording path throws — the device
-/// reported its AP up and nothing ever on it, which is the stale-credential shape,
-/// and the repair for it is a manual one no API can perform.
+/// The stop reason must carry what the single-recording path throws. Here this
+/// host holds nothing on the endpoint's subnet, so the pre-flight refuses the
+/// connect outright and the verdict is the stale-credential one — the repair for
+/// which is manual and which no API can perform.
 @Test func aBatchStopsWithTheEnrichedConnectDiagnosisNotTheBareSymptom() async throws {
     let recordings = wifiBatchRecordings(2)
     let t = FakeTransport()
@@ -806,6 +807,7 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     t.script["APP&WIFIS"] = ["MCU&WIFIS&3"]   // AP up, never a client
     let session = PocketSession(transport: t, sessionKey: batchMatchingKey)
     try await session.start()
+    await session.setHostInterfaces(hostHolding(("utun4", "100.64.0.2")))
 
     let joiner = RecordingJoiner(shouldFail: false)
     let result = try await session.downloadOverWiFi(recordings,
@@ -819,12 +821,14 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     // The symptom the transcript used to show, and all of it …
     #expect(stopped.reason.contains("wifi tcp connect"))
     // … plus the diagnosis it used to omit.
-    #expect(stopped.reason.contains("the device never reported a client on its AP (no MCU&WIFIS&2)"))
-    #expect(stopped.reason.contains("nothing joined PKT01_EXAMPLE"))
+    #expect(stopped.reason.contains("THIS HOST is not on PKT01_EXAMPLE"))
+    #expect(stopped.reason.contains("Join PKT01_EXAMPLE and run this again"))
     #expect(stopped.reason.contains("exactly what this session's key implies"))
     #expect(stopped.reason.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
-    // Never a credential, so the transcript stays safe to paste into a report.
+    // Never a credential, so the transcript stays safe to paste into a report —
+    // and never this host's own address either.
     #expect(!stopped.reason.contains("ExampleK"))
+    #expect(!stopped.reason.contains("100.64.0.2"))
     // Nothing was left broadcasting, and the untried recording is named.
     #expect(stopped.remaining == [recordings[1]])
     #expect(joiner.box.left == 1)
@@ -835,11 +839,13 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
 }
 
 /// And the failure that actually happened on 2026-07-28, in the path that
-/// happened to run it: the device DID report a client, so the host was on the AP
-/// and the credentials were accepted. The batch must not print the stale-password
-/// guidance here — a diagnosis that confidently names the wrong cause costs more
-/// than a bare error — and must point at the access point's lifetime instead.
-@Test func aBatchDoesNotBlameCredentialsForAConnectFailureAfterAnAssociation() async throws {
+/// happened to run it: the device reported a client AND this host holds an address
+/// on the endpoint's subnet, so the credentials, the association and the access
+/// point's lifetime are all settled. The batch must print neither the
+/// stale-password guidance nor the lifetime one — a diagnosis that confidently
+/// names an eliminated cause costs more than a bare error — and must name the
+/// interface and whatever reason Network.framework gave instead.
+@Test func aBatchBlamesThePathNotCredentialsOrLifetimeWhenThisHostIsOnTheSubnet() async throws {
     let recordings = wifiBatchRecordings(2)
     let t = FakeTransport()
     scriptWiFiBatchConversation(on: t, recordings: recordings)
@@ -847,6 +853,7 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     scriptWiFiStateOracle(on: t, progression: healthyWiFiProgression)   // reaches MCU&WIFIS&2
     let session = PocketSession(transport: t, sessionKey: batchMatchingKey)
     try await session.start()
+    await session.setHostInterfaces(hostHolding(("utun4", "100.64.0.2"), ("lo0", "127.0.0.1")))
 
     let result = try await session.downloadOverWiFi(recordings,
                                                     endpointOverride: batchDeadEndpoint,
@@ -855,10 +862,13 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
 
     let stopped = try #require(result.stopped)
     #expect(stopped.reason.contains("wifi tcp connect"))
-    #expect(stopped.reason.contains("the device DID report a client on its access point"))
-    #expect(stopped.reason.contains("The access point's lifetime is what to spend less of"))
-    // The credential story is absent, in both of its recognisable forms.
+    #expect(stopped.reason.contains("this host IS on the device's subnet (lo0 holds 127.0.0.1)"))
+    // The reason the old handler discarded, in the line a batch actually prints.
+    #expect(stopped.reason.contains("Network.framework's last reason:"))
+    #expect(stopped.reason.contains("Connection refused"))
+    // Both eliminated stories are absent, in every recognisable form.
     #expect(!stopped.reason.contains("Forget"))
+    #expect(!stopped.reason.contains("The access point's lifetime"))
     #expect(!stopped.reason.contains("never reported a client on its AP"))
     await session.stop()
 }

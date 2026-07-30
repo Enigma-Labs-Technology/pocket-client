@@ -480,10 +480,36 @@ state `2` persisted for the full 180 s and never advanced to `1`.
 through the TCP connect itself. So in the `sync-wifi` run that reached
 `MCU&WIFIS&2` and then timed out connecting to `192.168.200.1:8475`, the access
 point was up, the host was associated, and pings were flowing. **AP lifetime is
-not what fails that transfer.** What remains is the device's TCP listener on
-:8475, or this client's socket code — and the way to tell them apart is to hold
-the AP up with `probe-ap-lifetime --keepalive --cap 300` and, from another shell
-while it runs, try `ping 192.168.200.1` and `nc -vz 192.168.200.1 8475`.
+not what fails that transfer.** What remained was the device's TCP listener on
+:8475, or this client's socket code — and the listener is ruled out by the capture
+itself, which shows the official app's SYN *preceding* its `APP&U&…` selection, so
+the listener is open before a recording is ever chosen.
+
+**That leaves this client's socket code, and two defects were found in it** (both
+in `Sources/PocketClient/Transport/WiFiTransfer.swift`, both fixed, neither yet
+confirmed on hardware):
+
+1. `NWConnection`'s `.waiting(NWError)` — the reason the path is not usable — was
+   discarded by the connect's state handler, so a failing run could only ever
+   report its own timeout. **This is why the cause could be proposed and
+   eliminated three times.** The reason now reaches the thrown message and the
+   whole state sequence reaches `DeviceEvent.wifiConnectPath`.
+2. The connection was created with default parameters and named no interface.
+   `Network.framework` runs its own path evaluation rather than following the BSD
+   route table, and this AP provides no internet while the host runs a mesh VPN
+   whose `utun` holds a default route — so a path that cannot reach
+   `192.168.200.1` can be selected, or waited on indefinitely. A silent 30 s
+   timeout with no error delivered to the caller is that signature exactly. It
+   also explains why iOS worked: there the app joins with
+   `NEHotspotConfiguration`, so the path belongs to the process. The connection
+   now requires the interface holding this host's address on the device's `/24`.
+
+Next hardware run: `pocket-cli sync-wifi <date> 2` on macOS. Whatever it does, the
+transcript will now name the interface the connect required and either quote
+`Network.framework`'s reason for refusing the path or state that it gave none.
+Holding the AP up with `probe-ap-lifetime --keepalive --cap 300` and trying
+`nc -vz 192.168.200.1 8475` from another shell while it runs remains the way to
+cross-check the listener from outside this client.
 
 `pocket-cli sync-wifi <date> [count]` remains the instrument for the *other* open
 question — whether a live session will serve a second recording — and it cannot

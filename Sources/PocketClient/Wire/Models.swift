@@ -119,6 +119,20 @@ public enum DeviceEvent: Sendable, Equatable {
     /// here for diagnosis: `byteCount` is the total surplus read, `preview`
     /// at most its first `TCPFetch.surplusPreviewLimit` bytes.
     case wifiTrailerReceived(byteCount: Int, preview: Data)
+    /// What the WiFi TCP connect did with this host's own network, in one line:
+    /// which interface holds an address on the device's subnet and was therefore
+    /// required of the connection, and — when the connect failed — every
+    /// `NWConnection` state it passed through, each `.waiting` with the reason
+    /// Network.framework attached to it.
+    ///
+    /// This is the verbose channel for `WiFiConnectDiagnosis`. The thrown error
+    /// names the *last* reason, because that is the diagnosis; the whole
+    /// transition sequence is longer than an error message should be and lands
+    /// here instead, where a harness transcript picks it up. Before it existed,
+    /// `.waiting(NWError)` was discarded by the connect's state handler and a
+    /// failing run could only ever report its own timeout — which is why the
+    /// cause of the macOS WiFi failure was guessed at three times.
+    case wifiConnectPath(String)
 }
 
 public enum TransferMode: Sendable, Equatable {

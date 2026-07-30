@@ -233,70 +233,118 @@ enum WiFiJoinDiagnosis: Equatable, Sendable, CaseIterable {
     }
 }
 
-/// What this package can say about a TCP connect that never completed, once the
-/// device's own report on its access point is taken into account.
+/// What this package can say about a TCP connect that never completed.
 ///
-/// `WiFiJoinDiagnosis` answers exactly one question — were the credentials
-/// current? — and on 2026-07-28 that was the wrong question. The Mac was
-/// demonstrably ON the access point: `ifconfig en0` held `192.168.200.2`, the
-/// client address from the capture, so association and DHCP had both succeeded.
-/// The transfer still failed, and by the time it ran both `ping 192.168.200.1`
-/// and `nc -vz 192.168.200.1 8475` answered **No route to host** — which, on a
-/// directly-connected subnet with a valid interface route and no hijacked
-/// gateway, means ARP went unanswered: the device was no longer there at layer 2.
-/// The access point had come up, served DHCP, and gone away again while the
-/// operator was in System Settings.
+/// Three causes have been proposed for the macOS failure and three have been
+/// eliminated on hardware: the credentials (the device reports `MCU&WIFIS&2`, so
+/// the host associated), the access point's lifetime (measured 2026-07-29: ~59 s
+/// unassisted, still up at the 180 s cap with `APP&WPING` every 10 s, and the
+/// keepalive now starts on the `MCU&WIFIO` ack and pings through the connect
+/// itself), and the device's listener not existing (the capture shows the
+/// official app's SYN *preceding* its `APP&U&…` selection). Guessing a fourth
+/// time is not the plan. So this reasons from the two pieces of evidence that
+/// were never collected before:
+///
+/// 1. **This host's own interfaces.** The device's address is a fixed constant on
+///    a directly-connected `/24`, so an interface holding an address on that
+///    `/24` proves this process can reach it and none proves it cannot. That is
+///    a statement about *this host*, unlike `MCU&WIFIS`, which reports `2` for
+///    any associated client — hardware-confirmed: a Mac auto-joining a
+///    remembered network satisfies it while proving nothing about this process.
+/// 2. **Network.framework's own reason.** `.waiting(NWError)` carries why the
+///    path is not usable, and the state handler used to discard it. That
+///    discarded value is why the cause was guessed at three times.
 ///
 /// A diagnosis that confidently names the wrong cause is worse than a bare error,
-/// so the credential story is told only where the device's report is consistent
-/// with it — the AP up, and nothing ever on it. Where the device reported a
-/// client, or reported its WiFi off from under us, the subject is the access
-/// point's lifetime and the text says so and says nothing about passwords.
+/// so the credential story is told only where the evidence is consistent with it:
+/// this host holding nothing on the device's subnet, which is what a silently
+/// rejected join looks like from here.
 enum WiFiConnectDiagnosis: Equatable, Sendable {
-    /// The device reported a client on its AP (`MCU&WIFIS&2`, or `1` which
-    /// subsumes it) and the socket still never opened. The host was associated,
-    /// so the credentials are settled and out of the picture.
-    case associatedThenUnreachable
+    /// No interface on this host holds an address on the device's subnet, so this
+    /// host is not on the access point — whatever the device reported about some
+    /// client. The strongest verdict available, and the only one that is about
+    /// this process rather than about the device's view of the world.
+    case hostNotOnTheAccessPoint(WiFiJoinDiagnosis)
+    /// This host **is** on the device's subnet, on the named interface, and the
+    /// socket still never opened. The association and the credentials are
+    /// therefore settled, and the subject is the path from this process to the
+    /// device — carrying whatever reason Network.framework last gave for not
+    /// being able to take it, or the fact that it gave none.
+    case pathUnusableFromThisHost(interface: String, address: String, waitingReason: String?)
     /// The device reported its WiFi **off** (`MCU&WIFIS&0`) while this client was
     /// still waiting for the association: the access point came down on its own,
     /// and no credential ever got the chance to be wrong.
     case accessPointClosedItself
+    /// The device reported a client on its AP (`MCU&WIFIS&2`, or `1` which
+    /// subsumes it), the socket never opened, and this host's interfaces could
+    /// not be checked against the endpoint — reached only when a caller overrode
+    /// the endpoint with something that is not an IPv4 host:port, since
+    /// `WiFiEndpoint.default` always is. The device's report is then all there is.
+    case associatedThenUnreachable
     /// The device kept reporting its AP up with nothing on it (`MCU&WIFIS&3`, and
-    /// never `2`) — the shape a stale saved password makes, where the join is
-    /// attempted, silently rejected, and neither OS says why.
+    /// never `2`), and — as above — there was no interface evidence to prefer to
+    /// it. The shape a stale saved password makes.
     case nothingEverJoined(WiFiJoinDiagnosis)
 
-    /// The repair for both access-point-lifetime cases. It deliberately says
-    /// nothing about saved passwords: the device's own report has ruled that
-    /// story out here, and repeating it anyway is how a diagnosis starts costing
-    /// more than it saves.
+    /// What is known about the access point's lifetime, for the one verdict where
+    /// the device itself said the AP had gone: it is measured, not feared, and it
+    /// is no longer a hypothesis about this failure. Says nothing about saved
+    /// passwords — the device's own report rules that story out here, and
+    /// repeating it anyway is how a diagnosis starts costing more than it saves.
     private static func lifetimeRepair(ssid: String) -> String {
-        "The access point's lifetime is what to spend less of: the device brings it up on "
-        + "APP&WIFIO and does not hold it open indefinitely, so every second between the join "
-        + "and this connect is charged against it. On macOS the join is a person — System "
-        + "Settings, a network to find, a password to type — which is easily a minute, and a "
-        + "minute is enough. Join \(ssid) promptly, stay on it, and run this again. The "
-        + "signature that confirms it, from the host side: `ifconfig` still showing a "
-        + "\(WiFiEndpoint.clientSubnet) address while `ping \(WiFiEndpoint.deviceHost)` answers "
-        + "`No route to host` — that address is a DHCP lease the device has stopped answering "
-        + "ARP for."
+        "The access point's lifetime is measured, not a mystery: on 2026-07-29 an unassisted AP "
+        + "lasted about 59 s, while one held with APP&WPING every 10 s was still up at the 180 s "
+        + "cap. This session pings from the MCU&WIFIO ack onwards — through the join and through "
+        + "this connect — so an access point that went away anyway went away for some other "
+        + "reason: the device rebooting, its WiFi switched off at the device, or another client "
+        + "taking the session. Rejoin \(ssid) and run this again; if it repeats, "
+        + "`pocket-cli probe-ap-lifetime` measures the lifetime directly. The host-side "
+        + "signature, for the record: `ifconfig` still showing a \(WiFiEndpoint.clientSubnet) "
+        + "address while `ping \(WiFiEndpoint.deviceHost)` answers `No route to host` — that "
+        + "address is a DHCP lease the device has stopped answering ARP for."
     }
 
     /// Reads after the failure text, in the register the rest of the package
     /// uses: what is known, then what to do about it.
     func guidance(ssid: String) -> String {
         switch self {
-        case .associatedThenUnreachable:
-            return "the device DID report a client on its access point (MCU&WIFIS&2), so this host "
-                + "was associated and its credentials were accepted — nothing about the password "
-                + "is in question. The socket then never opened, which means the access point "
-                + "stopped answering after the association rather than ever refusing it. "
-                + Self.lifetimeRepair(ssid: ssid)
+        case .hostNotOnTheAccessPoint(let join):
+            return "no interface on this host holds an address on the device's subnet, so THIS HOST "
+                + "is not on \(ssid) — and that is evidence about this process, which MCU&WIFIS is "
+                + "not: the device reports 2 for any associated client, and a Mac auto-joining a "
+                + "remembered network satisfies that check while proving nothing about this "
+                + "client. Join \(ssid) and run this again. " + join.guidance(ssid: ssid)
+        case .pathUnusableFromThisHost(let interface, let address, let waitingReason):
+            let reason = waitingReason.map {
+                "Network.framework's last reason for not proceeding was: \($0). "
+            } ?? "Network.framework never gave a reason at all — the connection sat in .waiting "
+                + "without ever saying why, which is what its own path evaluation failing to find "
+                + "a usable route looks like, as distinct from a refused connect (immediate) or an "
+                + "unreachable host (fast). "
+            return "this host IS on the device's subnet (\(interface) holds \(address)), so the "
+                + "association and the credentials are settled and out of the picture, and so is "
+                + "the access point's lifetime, because a device that had closed its AP would not "
+                + "still be leasing this address. What failed is the path from this process to "
+                + "\(WiFiEndpoint.deviceHost). " + reason
+                + "This client asks Network.framework for \(interface) specifically, so that a "
+                + "route which cannot reach the recorder is not chosen — the text above says "
+                + "whether that could actually be applied. Look next for something else holding "
+                + "that path: a VPN or mesh client owning the default route, a packet filter, or "
+                + "the device no longer listening on \(WiFiEndpoint.devicePort). From this host, "
+                + "`ifconfig \(interface)` should still show \(address) and "
+                + "`nc -vz \(WiFiEndpoint.deviceHost) \(WiFiEndpoint.devicePort)` should connect."
         case .accessPointClosedItself:
             return "the device reported its WiFi off (MCU&WIFIS&0) while this client was still "
                 + "waiting for the association, so the access point came down before anything "
                 + "could connect to it — that is the device's doing, not a credential this host "
                 + "holds. " + Self.lifetimeRepair(ssid: ssid)
+        case .associatedThenUnreachable:
+            return "the device DID report a client on its access point (MCU&WIFIS&2), so something "
+                + "was associated and its credentials were accepted — nothing about the password "
+                + "is in question. This client could not check its own interfaces against the "
+                + "endpoint, because the endpoint is not an IPv4 host:port, so the path is what "
+                + "remains: give it the device's own address and this error will name the "
+                + "interface it required and the reason Network.framework gave."
         case .nothingEverJoined(let join):
             return "the device never reported a client on its AP (no MCU&WIFIS&2), so nothing "
                 + "joined \(ssid): " + join.guidance(ssid: ssid)
@@ -330,6 +378,130 @@ public struct WiFiReadiness: Sendable {
     /// timeout did not thereby ask to wait that long for a state transition the
     /// device reports in about 100 ms.
     static let maximumAccessPointOffWait = Duration.seconds(5)
+
+    /// Cap on the pre-flight's wait for this host to actually hold an address on
+    /// the device's subnet (`PocketSession.resolveWiFiPathPin`).
+    ///
+    /// Not zero, deliberately. On iOS the process joins the network itself and
+    /// `NEHotspotConfiguration.apply` returns once the phone has associated,
+    /// which can be *before* DHCP has handed it an address — and the iOS path
+    /// works today, so the pre-flight must not declare the host off a network it
+    /// is in the middle of joining. On macOS, where the join is a person and the
+    /// association wait has already cost seconds, the address is there on the
+    /// first look and nothing is waited for at all. Either way this is a
+    /// rounding error against the 30 s timeout it replaces.
+    static let maximumHostAddressWait = Duration.seconds(3)
+
+    /// Cap on the wait for Network.framework's own list of available interfaces
+    /// (`HostInterfaces.availableInterface`). A monitor that never reports leaves
+    /// the connection unpinned — which is exactly the behaviour that shipped —
+    /// rather than holding a transfer up.
+    static let maximumInterfaceSnapshotWait = Duration.milliseconds(500)
+}
+
+// MARK: - Which of this host's interfaces can reach the device
+
+/// One IPv4 address this host holds, and the interface holding it.
+///
+/// The device's address is a fixed constant (`WiFiEndpoint.deviceHost`) on a
+/// directly-connected `/24`, so an interface holding an address on that `/24`
+/// is the one — and the only one — that can reach it. That makes this list the
+/// strongest evidence available about whether **this host** is on the recorder's
+/// access point, and evidence of a different kind from `MCU&WIFIS`: the device
+/// reports `2` for *any* associated client, and hardware confirmed that a Mac
+/// auto-joining a remembered network satisfies that check while proving nothing
+/// about this process.
+struct HostInterfaceAddress: Sendable, Equatable {
+    /// BSD interface name — `en0`, `utun4`, `lo0`.
+    let interfaceName: String
+    /// Dotted-quad IPv4 address.
+    let address: String
+
+    init(interfaceName: String, address: String) {
+        self.interfaceName = interfaceName
+        self.address = address
+    }
+}
+
+/// Enumerates this host's IPv4 interface addresses. The seam the WiFi pre-flight
+/// is tested through — see `PocketSession.hostInterfaces`.
+typealias HostInterfaceLister = @Sendable () -> [HostInterfaceAddress]
+
+enum HostInterfaces {
+    /// The real host, through `getifaddrs`. Platform, not a dependency, and
+    /// present on both iOS and macOS.
+    static let system: HostInterfaceLister = { systemIPv4Addresses() }
+
+    /// IPv4 addresses on interfaces that are up. IPv4 only and up only because
+    /// of the question being asked: which interface can reach an IPv4 address on
+    /// a directly-connected subnet. A down interface answers nothing.
+    static func systemIPv4Addresses() -> [HostInterfaceAddress] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return [] }
+        defer { freeifaddrs(head) }
+        var found: [HostInterfaceAddress] = []
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard entry.pointee.ifa_flags & UInt32(IFF_UP) != 0,
+                  let socketAddress = entry.pointee.ifa_addr,
+                  socketAddress.pointee.sa_family == UInt8(AF_INET),
+                  let name = String(validatingCString: entry.pointee.ifa_name)
+            else { continue }
+            // `sin_addr.s_addr` is in network byte order, so its bytes in memory
+            // order already read a.b.c.d — no endian conversion, and no
+            // `getnameinfo` round trip through a C string to undo afterwards.
+            let raw = socketAddress.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                $0.pointee.sin_addr.s_addr
+            }
+            let octets = withUnsafeBytes(of: raw) { Array($0) }
+            found.append(HostInterfaceAddress(
+                interfaceName: name,
+                address: octets.map(String.init).joined(separator: ".")))
+        }
+        return found
+    }
+
+    /// The `NWInterface` Network.framework currently lists under `name`, or nil
+    /// when it lists none.
+    ///
+    /// Loopback is legitimately absent from that list, so a nil here is ordinary
+    /// and means "leave the connection unpinned" — the behaviour that shipped.
+    static func availableInterface(named name: String, within bound: Duration) async -> NWInterface? {
+        await availableInterfaces(within: bound).first { $0.name == name }
+    }
+
+    /// Every `NWInterface` Network.framework currently considers available.
+    ///
+    /// `NWPathMonitor` is the only public source of these values — `NWInterface`
+    /// has no public initializer — and it reports asynchronously, hence the
+    /// bounded poll for its first report. A monitor that never reports yields an
+    /// empty list, which leaves the connection unpinned rather than holding a
+    /// transfer up.
+    static func availableInterfaces(within bound: Duration) async -> [NWInterface] {
+        let snapshot = InterfaceSnapshot()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { snapshot.record($0.availableInterfaces) }
+        monitor.start(queue: .global())
+        defer { monitor.cancel() }
+        let step = min(.milliseconds(5), bound)
+        let deadline = ContinuousClock.now + bound
+        while ContinuousClock.now < deadline {
+            if let interfaces = snapshot.value { return interfaces }
+            if Task.isCancelled { break }
+            try? await Task.sleep(for: step)
+        }
+        return snapshot.value ?? []
+    }
+
+    /// The monitor reports on its own queue; the poll above reads from the
+    /// caller's. One lock, one hand-off.
+    private final class InterfaceSnapshot: @unchecked Sendable {
+        private let lock = NSLock()
+        private var interfaces: [NWInterface]?
+        func record(_ interfaces: [NWInterface]) {
+            lock.lock(); self.interfaces = interfaces; lock.unlock()
+        }
+        var value: [NWInterface]? { lock.lock(); defer { lock.unlock() }; return interfaces }
+    }
 }
 
 // NWEndpoint is written `Network.NWEndpoint` throughout this file: on iOS,
@@ -339,15 +511,173 @@ enum WiFiEndpoint {
     /// The device serves the file at this address once a client joins its AP.
     static let deviceHost = "192.168.200.1"
     static let devicePort: UInt16 = 8475
-    /// The subnet the device's DHCP server leases from — `192.168.200.2` in the
-    /// capture and on hardware. Named because `WiFiConnectDiagnosis` quotes it:
-    /// still holding one of these addresses while the device answers nothing is
-    /// the signature of an access point that has gone away.
-    static let clientSubnet = "192.168.200.x"
+
+    /// The `/24` the device's access point lives on, **derived** from
+    /// `deviceHost` rather than written out a second time: every piece of
+    /// interface reasoning below compares against it, and a subnet spelled twice
+    /// is a subnet that can disagree with itself.
+    static var deviceSubnet: String? { ipv4SubnetPrefix(of: deviceHost) }
+
+    /// The addresses the device's DHCP server leases from — `192.168.200.2` in
+    /// the capture and on hardware. Named because `WiFiConnectDiagnosis` quotes
+    /// it: still holding one of these while the device answers nothing is the
+    /// signature of an access point that has gone away.
+    static var clientSubnet: String { deviceSubnet.map { "\($0).x" } ?? deviceHost }
 
     static var `default`: Network.NWEndpoint {
         .hostPort(host: Network.NWEndpoint.Host(deviceHost),
                   port: Network.NWEndpoint.Port(rawValue: devicePort)!)
+    }
+
+    /// The first three octets of a dotted-quad IPv4 address — the `/24` it sits
+    /// in — or nil when `address` is not one.
+    ///
+    /// A `/24` because that is what the device's access point is: the device at
+    /// `.1`, the client leased `.2` (capture-verified, hardware-confirmed). "On
+    /// the same `/24`" is therefore exactly "can reach the device directly".
+    static func ipv4SubnetPrefix(of address: String) -> String? {
+        let octets = address.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4, octets.allSatisfy({ UInt8($0) != nil }) else { return nil }
+        return octets.prefix(3).joined(separator: ".")
+    }
+
+    /// The dotted-quad IPv4 address `endpoint` names, or nil when it names
+    /// something else — a hostname, an IPv6 literal, a Bonjour service. Only an
+    /// IPv4 host:port can be compared against this host's own addresses;
+    /// anything else leaves the connection unpinned, exactly as before.
+    static func ipv4Host(of endpoint: Network.NWEndpoint) -> String? {
+        guard case .hostPort(let host, _) = endpoint else { return nil }
+        let literal: String
+        switch host {
+        case .ipv4(let address): literal = "\(address)"
+        case .name(let name, _):  literal = name
+        default:                  return nil
+        }
+        return ipv4SubnetPrefix(of: literal) != nil ? literal : nil
+    }
+}
+
+/// Which interface the WiFi TCP connect requires of itself, and why that one.
+///
+/// `NWConnection(to: endpoint, using: .tcp)` — default parameters — is what this
+/// replaces, and the reason it had to be replaced is that Network.framework runs
+/// its own path evaluation and does **not** simply follow the BSD route table.
+/// The recorder's access point provides no internet, and a Mac running a mesh
+/// VPN carries a `utun` holding a default route, so the framework can select —
+/// or wait indefinitely for — a path that cannot reach `192.168.200.1`. A silent
+/// 30 s timeout with no error delivered to the caller is the signature of that,
+/// as distinct from a refused connect (immediate) or an unreachable host (fast).
+///
+/// It is also why iOS worked while macOS did not: on iOS the app joins with
+/// `NEHotspotConfiguration`, so the path belongs to the process; on macOS the
+/// join is external and nothing identified the interface.
+enum WiFiPathPin: Sendable, Equatable {
+    /// This host holds an address on the device's `/24`, on the interface named
+    /// here — so that interface, and only that interface, can reach the device.
+    case interface(HostInterfaceAddress, deviceSubnet: String)
+    /// No interface holds an address on the device's `/24`: this host is not on
+    /// the access point and the connect must not be attempted. Carries what the
+    /// host *does* hold, so the message can say what was looked at.
+    case hostNotOnTheDeviceSubnet(deviceSubnet: String, held: [HostInterfaceAddress])
+    /// The endpoint is not an IPv4 host:port, so there is no subnet to compare
+    /// this host's interfaces against. Behaves exactly as before this existed:
+    /// default parameters, and the device's own report is the only evidence.
+    case noSubnetToCompare
+
+    /// Picks the interface that can reach `endpoint` directly.
+    static func choose(reaching endpoint: Network.NWEndpoint,
+                       among addresses: [HostInterfaceAddress]) -> WiFiPathPin {
+        guard let host = WiFiEndpoint.ipv4Host(of: endpoint),
+              let subnet = WiFiEndpoint.ipv4SubnetPrefix(of: host) else { return .noSubnetToCompare }
+        // First match wins. Two interfaces on one directly-connected /24 cannot
+        // be told apart from here, and either of them reaches the device.
+        if let match = addresses.first(where: {
+            WiFiEndpoint.ipv4SubnetPrefix(of: $0.address) == subnet
+        }) {
+            return .interface(match, deviceSubnet: subnet)
+        }
+        return .hostNotOnTheDeviceSubnet(deviceSubnet: subnet, held: addresses)
+    }
+
+    /// The interface to require of the connection, if any.
+    var interfaceName: String? {
+        if case .interface(let held, _) = self { held.interfaceName } else { nil }
+    }
+
+    /// Interface types the recorder's access point provably is not, prohibited
+    /// alongside the required interface.
+    ///
+    /// Belt and braces — the required interface is the pin — and deliberately
+    /// derived from the chosen interface's own name so this can never prohibit
+    /// the very interface it requires. `en*` is Wi-Fi or wired Ethernet on both
+    /// platforms and `lo*` is loopback, so for those a tunnel (`.other`, which is
+    /// what a mesh VPN's `utun` reports as) can be excluded outright. For any
+    /// other name the chosen interface might itself be `.other`, so only cellular
+    /// is excluded — and cellular can hold no address on a directly-connected
+    /// `/24` in any case. Where there is no evidence at all, nothing is
+    /// prohibited: that path must behave exactly as it did before.
+    var prohibitedInterfaceTypes: [NWInterface.InterfaceType] {
+        guard let name = interfaceName else { return [] }
+        return name.hasPrefix("en") || name.hasPrefix("lo") ? [.cellular, .other] : [.cellular]
+    }
+
+    /// TCP parameters for a connection that must use `interface`.
+    ///
+    /// `requiredInterface` is the pin, and **not** `requiredLocalEndpoint`.
+    /// Measured on this SDK: a connection required to use `en0` while its
+    /// destination is reachable only over loopback sits in
+    /// `.waiting(POSIXErrorCode 50: Network is down)` rather than quietly going
+    /// elsewhere, so `requiredInterface` is enforced — while
+    /// `requiredLocalEndpoint` was ignored outright, including when the address
+    /// it named belonged to no interface on the machine. Pinning with a
+    /// mechanism the framework ignores would be another unverified guess, which
+    /// is the thing this change exists to stop making.
+    ///
+    /// `interface` is nil when Network.framework does not list the chosen
+    /// interface among the ones it considers available; the connection is then
+    /// left unpinned — the previous behaviour — and the failure message says so
+    /// rather than implying a pin that was never applied.
+    func tcpParameters(requiring interface: NWInterface?) -> NWParameters {
+        let parameters = NWParameters.tcp
+        if let interface { parameters.requiredInterface = interface }
+        let prohibited = prohibitedInterfaceTypes
+        if !prohibited.isEmpty { parameters.prohibitedInterfaceTypes = prohibited }
+        return parameters
+    }
+
+    /// One line for the event stream, before the attempt: what this host looks
+    /// like and what the connect is therefore going to do.
+    var summary: String {
+        switch self {
+        case .interface(let held, let subnet):
+            return "wifi tcp connect will require \(held.interfaceName) — it holds \(held.address) "
+                + "on the device's \(subnet).0/24"
+        case .hostNotOnTheDeviceSubnet(let subnet, let held):
+            return "wifi tcp connect pre-flight: NO interface on this host holds an address on the "
+                + "device's \(subnet).0/24 — this host holds "
+                + Self.summarize(held, deviceSubnet: subnet)
+        case .noSubnetToCompare:
+            return "wifi tcp connect: the endpoint is not an IPv4 host:port, so no interface is "
+                + "required of it (unpinned, as before)"
+        }
+    }
+
+    /// This host's addresses, for a message that must say what it looked at
+    /// without publishing where this host lives.
+    ///
+    /// An address on the device's own subnet is printed in full — that subnet is
+    /// the recorder's and is already written down in this repository — and every
+    /// other address is reduced to its `/24` with the host octet elided. These
+    /// messages are printed by `sync-wifi`, and its transcripts get pasted into
+    /// a public protocol reference, where somebody's LAN or mesh address has no
+    /// business being.
+    static func summarize(_ addresses: [HostInterfaceAddress], deviceSubnet: String) -> String {
+        guard !addresses.isEmpty else { return "no IPv4 address at all" }
+        return addresses.map { held in
+            let prefix = WiFiEndpoint.ipv4SubnetPrefix(of: held.address)
+            let shown = prefix == deviceSubnet ? held.address : "\(prefix ?? held.address).x"
+            return "\(held.interfaceName) \(shown)"
+        }.joined(separator: ", ")
     }
 }
 
@@ -385,6 +715,160 @@ private final class ResumeOnce: @unchecked Sendable {
     }
 }
 
+/// Watches one connect attempt's `NWConnection` states: decides what the connect
+/// should do about each, and — the point of it — keeps what the non-terminal ones
+/// said.
+///
+/// `.waiting(NWError)` carries Network.framework's own reason for not being able
+/// to proceed, and the state handler this replaces threw it away:
+///
+///     default:
+///         break   // .setup / .preparing / .waiting — keep waiting
+///
+/// A failing run could therefore only ever report its own timeout, which is why
+/// the cause of the macOS WiFi failure was proposed and eliminated three times
+/// over. `.waiting` repeats as conditions change, so the most recent reason is
+/// the diagnosis and the whole sequence is the record.
+///
+/// A type of its own, driven by `observe`, so a test can put the exact state
+/// sequence a failing run produces through the very code the connect runs — with
+/// no radio and no access point.
+final class WiFiConnectWatcher: @unchecked Sendable {
+    /// What the connect should do about the state just observed.
+    enum Outcome: Equatable {
+        case ready
+        /// Terminal failure, with the symptom line for it.
+        case failed(String)
+        case cancelled
+        /// `.setup` / `.preparing` / `.waiting` — recorded, and kept waiting on.
+        case keepWaiting
+    }
+
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    private var reason: String?
+
+    /// Records `state` and says what to do about it.
+    func observe(_ state: NWConnection.State) -> Outcome {
+        switch state {
+        case .ready:
+            note("ready", reason: nil)
+            return .ready
+        case .failed(let error):
+            // `localizedDescription` here, keeping the message this path has
+            // always produced; `.waiting` below wants the richer form.
+            note("failed(\(error.localizedDescription))", reason: nil)
+            return .failed("wifi tcp connect failed: \(error.localizedDescription)")
+        case .cancelled:
+            note("cancelled", reason: nil)
+            return .cancelled
+        case .waiting(let error):
+            // The whole reason this type exists. `String(describing:)` rather
+            // than `localizedDescription` because the POSIX code is the
+            // diagnosis: ENETDOWN (50) is a path with no usable route,
+            // EHOSTUNREACH (65) is a route with nothing on the other end, and
+            // ECONNREFUSED (61) is a host that answered. "Network is down"
+            // alone does not separate those.
+            let described = String(describing: error)
+            note("waiting(\(described))", reason: described)
+            return .keepWaiting
+        case .setup:
+            note("setup", reason: nil)
+            return .keepWaiting
+        case .preparing:
+            note("preparing", reason: nil)
+            return .keepWaiting
+        @unknown default:
+            note("unrecognised state", reason: nil)
+            return .keepWaiting
+        }
+    }
+
+    /// One lock for both fields: a reader must never see a transition recorded
+    /// without the reason that came with it.
+    private func note(_ transition: String, reason newReason: String?) {
+        lock.lock()
+        recorded.append(transition)
+        if let newReason { reason = newReason }
+        lock.unlock()
+    }
+
+    /// Network.framework's most recent reason for not being able to proceed, or
+    /// nil when it never gave one — which is itself a finding, and one this code
+    /// previously could not state.
+    var lastWaitingReason: String? { lock.lock(); defer { lock.unlock() }; return reason }
+
+    /// Every state observed, in order.
+    var transitions: [String] { lock.lock(); defer { lock.unlock() }; return recorded }
+
+    /// The failure to throw for `symptom`, carrying everything observed so far.
+    func failure(_ symptom: String, pin: WiFiPathPin, pinnedInterface: String?) -> WiFiConnectFailure {
+        lock.lock(); defer { lock.unlock() }
+        return WiFiConnectFailure(symptom: symptom, pin: pin, pinnedInterface: pinnedInterface,
+                                  waitingReason: reason, transitions: recorded)
+    }
+}
+
+/// A WiFi TCP connect that produced no socket, carrying everything the attempt
+/// learned about why.
+///
+/// Not a `PocketError`: it lives only between `TCPFetch.connect` and
+/// `PocketSession.diagnosed(connectFailure:…)`, which reads the evidence, picks
+/// the diagnosis it implies, and turns the pair into the
+/// `PocketError.transferFailed` every caller already handles.
+struct WiFiConnectFailure: Error, Sendable, Equatable {
+    /// The bare symptom, in the words the message used to have all to itself.
+    let symptom: String
+    /// Which interface the connect chose, and why that one.
+    let pin: WiFiPathPin
+    /// The interface actually required of the connection — nil when the chosen
+    /// one could not be required (Network.framework did not list it) or when
+    /// there was nothing to choose. Distinguishing "pinned and still failed"
+    /// from "could not pin" is the difference between two quite different next
+    /// steps, so it is never implied.
+    let pinnedInterface: String?
+    /// Network.framework's most recent `.waiting` reason, or nil when it gave
+    /// none.
+    let waitingReason: String?
+    /// Every state the attempt passed through, in order.
+    let transitions: [String]
+
+    /// What the connect did with this host's network, in a clause.
+    private var pinStatement: String {
+        switch pin {
+        case .interface(let held, let subnet):
+            let holds = "holds \(held.address) on the device's \(subnet).0/24"
+            return pinnedInterface == nil
+                ? "\(held.interfaceName) \(holds), but Network.framework does not list it among its "
+                    + "available interfaces, so the connection could not be required to use it"
+                : "the connection required \(held.interfaceName), which \(holds)"
+        case .hostNotOnTheDeviceSubnet(let subnet, let held):
+            return "no interface on this host holds an address on the device's \(subnet).0/24, so "
+                + "this host is not on the recorder's access point — this host holds "
+                + WiFiPathPin.summarize(held, deviceSubnet: subnet)
+        case .noSubnetToCompare:
+            return "the endpoint is not an IPv4 host:port, so there was no subnet to compare this "
+                + "host's interfaces against and no interface to require"
+        }
+    }
+
+    /// The thrown message: the symptom, what the connect did about this host's
+    /// interfaces, and the last reason Network.framework gave. Deliberately NOT
+    /// the whole transition sequence — that is longer than an error message
+    /// should be, and goes to `DeviceEvent.wifiConnectPath` instead.
+    var detail: String {
+        var text = "\(symptom) — \(pinStatement)"
+        if let waitingReason { text += "; Network.framework's last reason: \(waitingReason)" }
+        return text
+    }
+
+    /// The verbose line: what was pinned, and every state, in order.
+    var pathReport: String {
+        let states = transitions.isEmpty ? "none observed" : transitions.joined(separator: " -> ")
+        return "wifi tcp connect path: \(pinStatement); states: \(states)"
+    }
+}
+
 /// TCP client for the device's :8475 file push. The connection is
 /// established FIRST (the device reports it as `MCU&WIFIS&1`) and only then
 /// does the caller run the `APP&U&<id>` + `APP&U&WIFI` selection over BLE —
@@ -393,29 +877,51 @@ enum TCPFetch {
     /// Opens the connection and waits for `.ready`, bounded by `timeout` —
     /// without the bound, an unreachable endpoint leaves `NWConnection` in
     /// `.waiting` forever.
+    ///
+    /// `pin` is which of this host's interfaces may carry it, computed by
+    /// `PocketSession.resolveWiFiPathPin`. A pin that says this host holds no
+    /// address on the device's subnet is a connect that cannot succeed, and it
+    /// fails here and now rather than spending the whole timeout discovering it.
     static func connect(to endpoint: Network.NWEndpoint,
-                        timeout: Duration = .seconds(30)) async throws -> NWConnection {
-        let connection = NWConnection(to: endpoint, using: .tcp)
+                        timeout: Duration = .seconds(30),
+                        pin: WiFiPathPin = .noSubnetToCompare) async throws -> NWConnection {
+        let watcher = WiFiConnectWatcher()
+        // The pre-flight. Nothing on the device's subnet means this host is not
+        // on the access point, and the useful answer is "join it", now, naming
+        // it — not a 30 s wait ending in a timeout that names nothing.
+        if case .hostNotOnTheDeviceSubnet = pin {
+            throw watcher.failure("wifi tcp connect not attempted", pin: pin, pinnedInterface: nil)
+        }
+        let required: NWInterface?
+        if let name = pin.interfaceName {
+            required = await HostInterfaces.availableInterface(
+                named: name, within: WiFiReadiness.maximumInterfaceSnapshotWait)
+        } else {
+            required = nil
+        }
+        let pinnedInterface = required?.name
+        let connection = NWConnection(to: endpoint, using: pin.tcpParameters(requiring: required))
         return try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     let once = ResumeOnce()
                     connection.stateUpdateHandler = { state in
-                        switch state {
+                        switch watcher.observe(state) {
                         case .ready:
                             if once.first() { continuation.resume() }
-                        case .failed(let error):
+                        case .failed(let symptom):
                             if once.first() {
-                                continuation.resume(throwing:
-                                    PocketError.transferFailed("wifi tcp connect failed: \(error.localizedDescription)"))
+                                continuation.resume(throwing: watcher.failure(
+                                    symptom, pin: pin, pinnedInterface: pinnedInterface))
                             }
                         case .cancelled:
                             if once.first() {
-                                continuation.resume(throwing:
-                                    PocketError.transferFailed("wifi tcp connect cancelled"))
+                                continuation.resume(throwing: watcher.failure(
+                                    "wifi tcp connect cancelled", pin: pin,
+                                    pinnedInterface: pinnedInterface))
                             }
-                        default:
-                            break   // .setup / .preparing / .waiting — keep waiting
+                        case .keepWaiting:
+                            break   // .setup / .preparing / .waiting — recorded, still waiting
                         }
                     }
                     connection.start(queue: .global())
@@ -425,7 +931,8 @@ enum TCPFetch {
                 // Doubles as the caller-cancellation path: the sleep throws
                 // CancellationError when the group is cancelled.
                 try await Task.sleep(for: timeout)
-                throw PocketError.transferFailed("wifi tcp connect timed out after \(timeout)")
+                throw watcher.failure("wifi tcp connect timed out after \(timeout)",
+                                      pin: pin, pinnedInterface: pinnedInterface)
             }
             defer { group.cancelAll() }
             do {
@@ -662,13 +1169,17 @@ extension PocketSession {
         do {
             // 6. TCP first — the selection that follows is served into this
             // socket, and the device reports it as MCU&WIFIS&1.
+            let endpoint = endpointOverride ?? WiFiEndpoint.default
+            // Which interface may carry it, decided once and read twice: the
+            // connect requires it, and the diagnosis reasons from it.
+            let pin = await resolveWiFiPathPin(to: endpoint, readiness: readiness)
             let connection: NWConnection
             do {
                 connection = try await connectKeepingLinkAlive(
-                    to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness,
+                    to: endpoint, readiness: readiness, pin: pin,
                     sessionActivity: session.activity)
             } catch {
-                throw diagnosed(connectFailure: error, ssid: session.ssid,
+                throw diagnosed(connectFailure: error, pin: pin, ssid: session.ssid,
                                 passphrase: session.passphrase,
                                 clientAssociationObserved: session.clientAssociationObserved,
                                 lastReportedState: session.lastReportedState)
@@ -939,19 +1450,78 @@ extension PocketSession {
     ///
     /// Message only. The error case, the control flow, and the AP teardown are
     /// unchanged, and `CancellationError` passes through untouched.
-    private func diagnosed(connectFailure error: Error, ssid: String, passphrase: String,
+    private func diagnosed(connectFailure error: Error, pin: WiFiPathPin,
+                           ssid: String, passphrase: String,
                            clientAssociationObserved: Bool,
                            lastReportedState: WiFiState?) -> Error {
-        guard case PocketError.transferFailed(let detail) = error else { return error }
-        let diagnosis: WiFiConnectDiagnosis
-        if clientAssociationObserved {
-            diagnosis = .associatedThenUnreachable
-        } else if lastReportedState == .off {
-            diagnosis = .accessPointClosedItself
+        let detail: String
+        let waitingReason: String?
+        if let failure = error as? WiFiConnectFailure {
+            detail = failure.detail
+            waitingReason = failure.waitingReason
+        } else if case PocketError.transferFailed(let text) = error {
+            // A connect closure a test (or a consumer) supplied, which never saw
+            // an NWConnection and has no path evidence to offer.
+            detail = text
+            waitingReason = nil
         } else {
-            diagnosis = .nothingEverJoined(wifiJoinDiagnosis(reportedPassphrase: passphrase))
+            return error
+        }
+        let diagnosis: WiFiConnectDiagnosis
+        switch pin {
+        case .hostNotOnTheDeviceSubnet:
+            // Host-side, and decisive: this process is not on the access point,
+            // whichever client the device happened to see.
+            diagnosis = .hostNotOnTheAccessPoint(wifiJoinDiagnosis(reportedPassphrase: passphrase))
+        case .interface(let held, _):
+            // This host holds a lease on the device's subnet. A device that had
+            // closed its access point would not still be leasing it, so the
+            // device's own `.off` report is the only thing that outranks the
+            // path here.
+            diagnosis = lastReportedState == .off
+                ? .accessPointClosedItself
+                : .pathUnusableFromThisHost(interface: held.interfaceName,
+                                            address: held.address,
+                                            waitingReason: waitingReason)
+        case .noSubnetToCompare:
+            // No interface evidence: fall back to reasoning from the device's
+            // report alone, exactly as this did before the pre-flight existed.
+            if clientAssociationObserved {
+                diagnosis = .associatedThenUnreachable
+            } else if lastReportedState == .off {
+                diagnosis = .accessPointClosedItself
+            } else {
+                diagnosis = .nothingEverJoined(wifiJoinDiagnosis(reportedPassphrase: passphrase))
+            }
         }
         return PocketError.transferFailed("\(detail) — \(diagnosis.guidance(ssid: ssid))")
+    }
+
+    /// Which of this host's interfaces the connect to `endpoint` may use.
+    ///
+    /// Waits, briefly and boundedly, rather than reading once: see
+    /// `WiFiReadiness.maximumHostAddressWait` for why an iOS join that has
+    /// associated but not yet finished DHCP must not be called "not on the
+    /// network". Only the negative answer is ever waited on — a host that already
+    /// holds the address resolves on the first look and sleeps not at all, which
+    /// is every healthy run.
+    func resolveWiFiPathPin(to endpoint: Network.NWEndpoint,
+                            readiness: WiFiReadiness) async -> WiFiPathPin {
+        let lister = hostInterfaces
+        var pin = WiFiPathPin.choose(reaching: endpoint, among: lister())
+        guard case .hostNotOnTheDeviceSubnet = pin else { return pin }
+        let bound = min(readiness.timeout, WiFiReadiness.maximumHostAddressWait)
+        // Floored, exactly as the session keepalive's tick is: a caller who set a
+        // zero poll interval did not ask for a spin loop.
+        let step = max(min(readiness.pollInterval, bound), .milliseconds(5))
+        let deadline = ContinuousClock.now + bound
+        while ContinuousClock.now < deadline {
+            if Task.isCancelled { return pin }
+            try? await Task.sleep(for: step)
+            pin = WiFiPathPin.choose(reaching: endpoint, among: lister())
+            if case .interface = pin { return pin }
+        }
+        return pin
     }
 
     /// Polls `APP&WIFIS` until the device reports `.clientJoined` (2) — or
@@ -1056,37 +1626,52 @@ extension PocketSession {
     /// test can hold the connect open until a WPING request is armed and
     /// prove the winner's cancellation cannot wedge this group; the default
     /// is the real TCP connect, so production behaviour is unchanged.
+    ///
+    /// Emits `DeviceEvent.wifiConnectPath` twice over a failure and once over a
+    /// success: what this host's interfaces made the connect decide, before it is
+    /// attempted, and — when it fails — every `NWConnection` state it went
+    /// through. That second line is the verbose form of the diagnosis the thrown
+    /// message carries in one sentence.
     func connectKeepingLinkAlive(
         to endpoint: Network.NWEndpoint,
         readiness: WiFiReadiness,
+        pin: WiFiPathPin = .noSubnetToCompare,
         sessionActivity: ActivityMonitor? = nil,
-        connect: @escaping @Sendable (Network.NWEndpoint, Duration) async throws -> NWConnection
-            = { try await TCPFetch.connect(to: $0, timeout: $1) }
+        connect: @escaping @Sendable (Network.NWEndpoint, Duration, WiFiPathPin) async throws
+            -> NWConnection = { try await TCPFetch.connect(to: $0, timeout: $1, pin: $2) }
     ) async throws -> NWConnection {
-        try await withThrowingTaskGroup(of: NWConnection?.self) { group in
-            group.addTask {
-                try await connect(endpoint, readiness.timeout)
-            }
-            group.addTask {
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: readiness.pingInterval)
-                    if Task.isCancelled { break }
-                    // Touched around the ping so the session keepalive — which
-                    // fires only on `pingInterval` of silence — stays off the
-                    // wire while this one is already covering the gap.
-                    sessionActivity?.touch()
-                    _ = try? await self.request(.wifiKeepalive, timeout: .seconds(2)) { $0 == .pong }
-                    sessionActivity?.touch()
+        emitEvent(.wifiConnectPath(pin.summary))
+        do {
+            return try await withThrowingTaskGroup(of: NWConnection?.self) { group in
+                group.addTask {
+                    try await connect(endpoint, readiness.timeout, pin)
                 }
-                return nil
+                group.addTask {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: readiness.pingInterval)
+                        if Task.isCancelled { break }
+                        // Touched around the ping so the session keepalive — which
+                        // fires only on `pingInterval` of silence — stays off the
+                        // wire while this one is already covering the gap.
+                        sessionActivity?.touch()
+                        _ = try? await self.request(.wifiKeepalive, timeout: .seconds(2)) {
+                            $0 == .pong
+                        }
+                        sessionActivity?.touch()
+                    }
+                    return nil
+                }
+                defer { group.cancelAll() }
+                guard let first = try await group.next(), let connection = first else {
+                    try Task.checkCancellation()
+                    throw PocketError.transferFailed("wifi tcp connect never completed")
+                }
+                sessionActivity?.touch()
+                return connection
             }
-            defer { group.cancelAll() }
-            guard let first = try await group.next(), let connection = first else {
-                try Task.checkCancellation()
-                throw PocketError.transferFailed("wifi tcp connect never completed")
-            }
-            sessionActivity?.touch()
-            return connection
+        } catch let failure as WiFiConnectFailure {
+            emitEvent(.wifiConnectPath(failure.pathReport))
+            throw failure
         }
     }
 
@@ -1331,6 +1916,10 @@ public struct WiFiBatchResult: Sendable, Equatable {
 /// detail is used verbatim; the rest get prose here rather than an enum dump.
 /// Exhaustive on purpose — a new `PocketError` case must be given a sentence.
 func wifiFailureText(_ error: Error) -> String {
+    // A connect failure carries structured evidence and renders its own sentence.
+    // `String(describing:)` on the struct would dump the fields instead, into the
+    // one line a batch prints as its stop reason.
+    if let connect = error as? WiFiConnectFailure { return connect.detail }
     guard let pocket = error as? PocketError else { return String(describing: error) }
     switch pocket {
     case .transferFailed(let detail):     return detail
@@ -1627,10 +2216,12 @@ extension PocketSession {
         // socket. Its own do/catch, not folded into the selection below, because
         // from the moment it returns EVERY exit must cancel it — a refusal that
         // left a socket open would leak one per recording.
+        let endpoint = endpointOverride ?? WiFiEndpoint.default
+        let pin = await resolveWiFiPathPin(to: endpoint, readiness: readiness)
         let connection: NWConnection
         do {
             connection = try await connectKeepingLinkAlive(
-                to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness,
+                to: endpoint, readiness: readiness, pin: pin,
                 sessionActivity: session.activity)
         } catch is CancellationError {
             sink.abort()
@@ -1640,10 +2231,13 @@ extension PocketSession {
             if reusingSession {
                 // Not terminal: the live session would not take a second socket,
                 // so this recording gets a fresh one. No diagnosis belongs on a
-                // refusal — the run is about to repair it itself.
-                return .refused("the device did not accept a second TCP connection on :8475 — it "
-                                + "stopped listening after the previous recording: "
-                                + wifiFailureText(error))
+                // refusal — the run is about to repair it itself. The lead-in is
+                // deliberately about the session rather than about the device's
+                // listener, because the pre-flight can now refuse here too: this
+                // host having left the network between recordings is repaired by
+                // the very same reopen (which asks for the join again).
+                return .refused("the live session would not take a second TCP connection on "
+                                + ":\(WiFiEndpoint.devicePort): " + wifiFailureText(error))
             }
             // A terminal connect failure, and the one the hardware run of
             // 2026-07-28 hit. It must carry the same diagnosis the
@@ -1652,7 +2246,7 @@ extension PocketSession {
             // enrichment 0.1.2 added for exactly this failure never reached the
             // transcript, which reported only `wifi tcp connect timed out after
             // 30.0 seconds` and left the cause to be found by hand.
-            let enriched = diagnosed(connectFailure: error, ssid: session.ssid,
+            let enriched = diagnosed(connectFailure: error, pin: pin, ssid: session.ssid,
                                      passphrase: session.passphrase,
                                      clientAssociationObserved: session.clientAssociationObserved,
                                      lastReportedState: session.lastReportedState)

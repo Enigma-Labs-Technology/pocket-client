@@ -400,7 +400,7 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
         readiness: WiFiReadiness(timeout: .seconds(30),
                                  pollInterval: .milliseconds(10),
                                  pingInterval: .milliseconds(10)),
-        connect: { endpoint, _ in
+        connect: { endpoint, _, _ in
             await pingArmed.wait()   // "ready" fires while the ping is armed
             return NWConnection(to: endpoint, using: .tcp)   // stand-in; never started
         })
@@ -620,17 +620,38 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     await session.stop()
 }
 
-/// The macOS shape of the failure: the join cannot fail (the operator pressed
-/// return), nothing associated, and the only symptom is a socket that never
-/// opens. The device is the witness — it reported no client — so the connect
-/// error carries the diagnosis too.
-@Test func aConnectFailureWithNoReportedAssociationNamesTheStaleCredential() async throws {
+/// A synthetic host — what `getifaddrs` would have said. The one thing a hermetic
+/// test cannot do is give the machine a real Wi-Fi interface on the recorder's
+/// subnet, and the *absence* of such an interface is precisely what the pre-flight
+/// has to get right, so the enumeration is a seam.
+/// (Internal, not private: WiFiBatchTests presents the same hosts.)
+func hostHolding(_ addresses: (interface: String, address: String)...) -> HostInterfaceLister {
+    let held = addresses.map {
+        HostInterfaceAddress(interfaceName: $0.interface, address: $0.address)
+    }
+    return { held }
+}
+
+/// The macOS shape of the failure, and the pre-flight that ends it: no interface
+/// on this host holds an address on the device's subnet, so this host is not on
+/// the access point — a statement about *this process*, which `MCU&WIFIS&2` is
+/// not (hardware confirmed a Mac auto-joining a remembered network satisfies that
+/// check while proving nothing about this client).
+///
+/// That used to be a 30 s wait ending in a timeout that named nothing. It now
+/// says so without attempting the connect at all, and names the network to join.
+@Test func aHostOnNoneOfTheDevicesSubnetIsToldToJoinInsteadOfWaitingOutTheTimeout() async throws {
     let t = FakeTransport()
     scriptWiFiConversation(on: t)
     t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
-    t.script["APP&WIFIS"] = ["MCU&WIFIS&3"]   // AP up, never a client
+    scriptWIFIStateMachine(on: t, apUpPolls: 0)   // the device even reports a client (2)
     let session = PocketSession(transport: t, sessionKey: matchingKey)
     try await session.start()
+    // A mesh VPN's utun carrying a default route, and a wired LAN. Neither is on
+    // the loopback subnet this test's endpoint lives on — so, as far as this
+    // process is concerned, this host is not on the recorder's network.
+    await session.setHostInterfaces(hostHolding(("utun4", "100.64.0.2"),
+                                                ("en1", "10.0.1.23")))
 
     let joiner = RecordingJoiner(shouldFail: false)
     var detail = ""
@@ -642,26 +663,50 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
         detail = thrown
     }
 
-    #expect(detail.contains("wifi tcp connect"))   // the original symptom is kept
-    #expect(detail.contains("the device never reported a client on its AP (no MCU&WIFIS&2)"))
-    #expect(detail.contains("nothing joined PKT01_EXAMPLE"))
+    // Not attempted, rather than attempted and waited out — which is the whole
+    // behaviour change, stated in the message itself.
+    #expect(detail.contains("wifi tcp connect not attempted"))
+    #expect(!detail.contains("timed out"))
+    #expect(detail.contains("no interface on this host holds an address on the device's 127.0.0.0/24"))
+    // The device said 2, and this host's own interfaces outrank that.
+    #expect(detail.contains("THIS HOST is not on PKT01_EXAMPLE"))
+    #expect(detail.contains("Join PKT01_EXAMPLE and run this again"))
+    // A join this host silently failed is a stale saved password, so the repair
+    // for one is the repair offered here.
     #expect(detail.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+    // What the host DOES hold is named, so the reader can see what was looked at
+    // — but reduced to its /24, because sync-wifi transcripts get pasted into a
+    // public protocol reference and somebody's mesh address does not belong there.
+    #expect(detail.contains("utun4 100.64.0.x"))
+    #expect(detail.contains("en1 10.0.1.x"))
+    #expect(!detail.contains("100.64.0.2"))
+    #expect(!detail.contains("10.0.1.23"))
     #expect(joiner.box.left == 1)   // the AP was still left on the failure path
     await session.stop()
 }
 
-/// The counterpart, and the reason the check is conditioned: when the device
-/// DID report an associated client the host is demonstrably on the AP, so cached
-/// credentials are not the story — and the failure gets its OWN diagnosis instead
-/// of none. This is the 2026-07-28 shape: associated, leased, and then the access
-/// point was gone by the time the socket was asked for.
-@Test func aConnectFailureAfterAnObservedAssociationBlamesTheAccessPointsLifetime() async throws {
+/// The counterpart, and the one that carries the value of this whole change: this
+/// host DOES hold an address on the endpoint's subnet, so the association and the
+/// credentials are settled — and so is the access point's lifetime, because a
+/// device that had closed its AP would not still be leasing the address. What is
+/// left is the path, and the failure now quotes the reason Network.framework gave
+/// for not being able to take it.
+///
+/// The reason is real, not injected: nothing listens on port 1, and a refused
+/// connect on this platform surfaces as `.waiting(ECONNREFUSED)` — a non-terminal
+/// state whose error the old handler discarded with `default: break`.
+@Test func aConnectFailureFromAHostOnTheSubnetNamesTheInterfaceAndWhatTheFrameworkSaid()
+    async throws {
     let t = FakeTransport()
     scriptWiFiConversation(on: t)
     t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
     scriptWIFIStateMachine(on: t, apUpPolls: 0)   // reaches MCU&WIFIS&2
     let session = PocketSession(transport: t, sessionKey: matchingKey)
     try await session.start()
+    // The host layout that broke macOS: a tunnel with a default route alongside
+    // the interface that actually reaches the endpoint.
+    await session.setHostInterfaces(hostHolding(("utun4", "100.64.0.2"),
+                                                ("lo0", "127.0.0.1")))
 
     var detail = ""
     do {
@@ -674,16 +719,265 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     }
 
     #expect(detail.contains("wifi tcp connect"))   // the original symptom is kept
-    // The credential story is absent — the host was demonstrably on the AP …
-    #expect(!detail.contains("never reported a client on its AP"))
+    // THE fix for defect 1: `.waiting(NWError)`'s payload reaches the message.
+    // Reverting the capture leaves the timeout naming nothing, exactly as before.
+    #expect(detail.contains("Network.framework's last reason:"))
+    #expect(detail.contains("Connection refused"))
+    // The interface that reaches the endpoint was chosen, and not the tunnel.
+    #expect(detail.contains("lo0 holds 127.0.0.1 on the device's 127.0.0.0/24"))
+    #expect(!detail.contains("utun4"))
+    #expect(detail.contains("this host IS on the device's subnet (lo0 holds 127.0.0.1)"))
+    // Neither of the two stories hardware has already eliminated.
     #expect(!detail.contains("Forget"))
-    // … and the access point's lifetime is named in its place, with the
-    // host-side signature that confirms it.
-    #expect(detail.contains("the device DID report a client on its access point (MCU&WIFIS&2)"))
-    #expect(detail.contains("nothing about the password is in question"))
-    #expect(detail.contains("The access point's lifetime is what to spend less of"))
-    #expect(detail.contains("`ping 192.168.200.1` answers `No route to host`"))
+    #expect(!detail.contains("The access point's lifetime"))
     await session.stop()
+}
+
+/// The verbose channel. `.waiting` repeats as conditions change, so the thrown
+/// message keeps the most recent reason and the whole transition sequence goes to
+/// the event stream, where a harness transcript picks it up.
+@Test func theConnectPathEventCarriesEveryStateTheAttemptPassedThrough() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    scriptWIFIStateMachine(on: t, apUpPolls: 0)
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+    await session.setHostInterfaces(hostHolding(("lo0", "127.0.0.1")))
+
+    _ = try? await session.downloadOverWiFi(recording, endpointOverride: deadEndpoint,
+                                            joiner: RecordingJoiner(shouldFail: false),
+                                            readiness: briefReadiness)
+    await session.stop()   // finishes the stream so the drain below terminates
+
+    var reported: [String] = []
+    for await event in session.events {
+        if case .wifiConnectPath(let line) = event { reported.append(line) }
+    }
+    // One line before the attempt saying what this host made it decide …
+    #expect(reported.contains { $0.contains("wifi tcp connect will require lo0") })
+    // … and one after it with every state, in order, each `.waiting` carrying the
+    // reason the thrown message quotes only once.
+    let path = try #require(reported.first { $0.contains("states:") })
+    #expect(path.contains("preparing"))
+    #expect(path.contains("waiting("))
+    #expect(path.contains("Connection refused"))
+}
+
+/// The watcher directly, with the exact state sequence a failing run produces —
+/// no radio, no access point. `.waiting` repeats, so the *most recent* reason is
+/// the diagnosis the message carries and the sequence keeps all of them.
+@Test func theConnectWatcherKeepsTheLastWaitingReasonAndTheWholeSequence() throws {
+    let watcher = WiFiConnectWatcher()
+    #expect(watcher.observe(.setup) == .keepWaiting)
+    #expect(watcher.observe(.preparing) == .keepWaiting)
+    #expect(watcher.observe(.waiting(.posix(.EHOSTUNREACH))) == .keepWaiting)
+    #expect(watcher.observe(.preparing) == .keepWaiting)
+    #expect(watcher.observe(.waiting(.posix(.ENETDOWN))) == .keepWaiting)
+
+    let reason = try #require(watcher.lastWaitingReason)
+    #expect(reason.contains("Network is down"))
+    // The POSIX code is kept, not flattened to a localised sentence: ENETDOWN (50)
+    // is a path with no usable route, EHOSTUNREACH (65) is a route with nothing on
+    // the far end, and telling those apart is the point.
+    #expect(reason.contains("50"))
+    #expect(watcher.transitions == ["setup", "preparing",
+                                    "waiting(\(String(describing: NWError.posix(.EHOSTUNREACH))))",
+                                    "preparing",
+                                    "waiting(\(String(describing: NWError.posix(.ENETDOWN))))"])
+
+    let pin = WiFiPathPin.interface(
+        HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2"),
+        deviceSubnet: "192.168.200")
+    let failure = watcher.failure("wifi tcp connect timed out after 30.0 seconds",
+                                  pin: pin, pinnedInterface: "en0")
+    // The message: the symptom, the interface required, the latest reason — and
+    // not the superseded one, which would read as the current state of the world.
+    #expect(failure.detail.hasPrefix("wifi tcp connect timed out after 30.0 seconds — "))
+    #expect(failure.detail.contains("the connection required en0, which holds 192.168.200.2 "
+                                    + "on the device's 192.168.200.0/24"))
+    #expect(failure.detail.contains("Network is down"))
+    #expect(!failure.detail.contains("No route to host"))
+    // The verbose line keeps both, in the order they happened.
+    #expect(failure.pathReport.contains("No route to host"))
+    #expect(failure.pathReport.contains("Network is down"))
+    #expect(failure.pathReport.contains("setup -> preparing -> waiting("))
+}
+
+/// The terminal states the watcher must still resolve, and the shape of the
+/// symptom it hands each of them.
+@Test func theConnectWatcherResolvesTheTerminalStates() {
+    #expect(WiFiConnectWatcher().observe(.ready) == .ready)
+    #expect(WiFiConnectWatcher().observe(.cancelled) == .cancelled)
+    let failed = WiFiConnectWatcher().observe(.failed(.posix(.ECONNREFUSED)))
+    guard case .failed(let symptom) = failed else {
+        Issue.record("expected .failed to be terminal")
+        return
+    }
+    #expect(symptom.hasPrefix("wifi tcp connect failed: "))
+    // A connect that never reached `.waiting` has no reason to report, and says
+    // so rather than inventing one — which is itself the signature of
+    // Network.framework's path evaluation failing silently.
+    let watcher = WiFiConnectWatcher()
+    _ = watcher.observe(.preparing)
+    #expect(watcher.lastWaitingReason == nil)
+    #expect(watcher.failure("wifi tcp connect timed out after 30.0 seconds",
+                            pin: .noSubnetToCompare,
+                            pinnedInterface: nil).detail.contains("last reason") == false)
+}
+
+/// The choice itself: the device's address is a fixed constant on a directly
+/// connected `/24`, so the interface holding an address on that `/24` is the one
+/// that can reach it — and a tunnel holding a default route is not, however
+/// attractive it looks to a path evaluator.
+@Test func thePinPicksTheInterfaceHoldingAnAddressOnTheDevicesSubnet() {
+    let recorderInterface = HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2")
+    let tunnel = HostInterfaceAddress(interfaceName: "utun4", address: "100.64.0.2")
+    let wired = HostInterfaceAddress(interfaceName: "en1", address: "10.0.1.23")
+
+    #expect(WiFiPathPin.choose(reaching: WiFiEndpoint.default,
+                               among: [tunnel, wired, recorderInterface])
+            == .interface(recorderInterface, deviceSubnet: "192.168.200"))
+    // Nothing on the device's subnet: this host is not on the access point, and
+    // the connect must not be attempted at all.
+    #expect(WiFiPathPin.choose(reaching: WiFiEndpoint.default, among: [tunnel, wired])
+            == .hostNotOnTheDeviceSubnet(deviceSubnet: "192.168.200", held: [tunnel, wired]))
+    #expect(WiFiPathPin.choose(reaching: WiFiEndpoint.default, among: [])
+            == .hostNotOnTheDeviceSubnet(deviceSubnet: "192.168.200", held: []))
+    // Nothing to compare against — a hostname endpoint — leaves it unpinned and
+    // reasoning from the device's report alone, exactly as before this existed.
+    #expect(WiFiPathPin.choose(reaching: .hostPort(host: "recorder.local", port: 8475),
+                               among: [recorderInterface]) == .noSubnetToCompare)
+}
+
+/// The subnet is derived from `deviceHost`, not written down a second time: a
+/// subnet spelled twice is a subnet that can disagree with itself.
+@Test func theDeviceSubnetIsDerivedFromTheDeviceHost() throws {
+    let subnet = try #require(WiFiEndpoint.deviceSubnet)
+    #expect(WiFiEndpoint.deviceHost.hasPrefix(subnet + "."))
+    #expect(WiFiEndpoint.clientSubnet == subnet + ".x")
+    #expect(WiFiEndpoint.ipv4SubnetPrefix(of: "10.0.0.7") == "10.0.0")
+    #expect(WiFiEndpoint.ipv4SubnetPrefix(of: "192.168.300.1") == nil)   // 300 is not an octet
+    #expect(WiFiEndpoint.ipv4SubnetPrefix(of: "recorder.local") == nil)
+    #expect(WiFiEndpoint.ipv4Host(of: WiFiEndpoint.default) == WiFiEndpoint.deviceHost)
+    #expect(WiFiEndpoint.ipv4Host(of: .hostPort(host: "recorder.local", port: 8475)) == nil)
+    #expect(WiFiEndpoint.ipv4Host(of: .unix(path: "/tmp/x")) == nil)
+}
+
+/// What the pin builds for Network.framework. `requiredInterface` is the pin —
+/// measured as strictly enforced on this SDK, unlike `requiredLocalEndpoint`,
+/// which was ignored outright — and the prohibited types are belt and braces
+/// derived from the chosen interface's own name so they can never prohibit the
+/// very interface they accompany.
+@Test func thePinnedParametersRequireTheInterfaceAndProhibitWhatItCannotBe() {
+    let physical = WiFiPathPin.interface(
+        HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2"),
+        deviceSubnet: "192.168.200")
+    #expect(physical.interfaceName == "en0")
+    // `en*` is Wi-Fi or wired Ethernet on both platforms, so a tunnel — `.other`,
+    // which is what a mesh VPN's utun reports as — can be excluded outright.
+    #expect(physical.prohibitedInterfaceTypes == [.cellular, .other])
+    // A tunnel-named interface might itself be `.other`, so that class stays
+    // allowed: this must never prohibit what it requires.
+    let tunnelHeld = HostInterfaceAddress(interfaceName: "utun9", address: "192.168.200.9")
+    #expect(WiFiPathPin.interface(tunnelHeld, deviceSubnet: "192.168.200")
+        .prohibitedInterfaceTypes == [.cellular])
+    // No evidence, no constraints: that path must behave exactly as before.
+    #expect(WiFiPathPin.noSubnetToCompare.prohibitedInterfaceTypes.isEmpty)
+    #expect(WiFiPathPin.noSubnetToCompare.interfaceName == nil)
+    let unconstrained = WiFiPathPin.noSubnetToCompare.tcpParameters(requiring: nil)
+    #expect(unconstrained.requiredInterface == nil)
+    #expect(unconstrained.prohibitedInterfaceTypes == nil)
+    // Chosen but unresolvable (Network.framework lists no such interface): still
+    // constrained by class, and the failure message says the pin was not applied
+    // rather than implying one that never was.
+    let unpinned = physical.tcpParameters(requiring: nil)
+    #expect(unpinned.requiredInterface == nil)
+    #expect(unpinned.prohibitedInterfaceTypes == [.cellular, .other])
+}
+
+/// The last mile of the pin, which no synthetic value can reach: `NWInterface`
+/// has no public initializer, so the only one that exists comes from a live
+/// `NWPath`. This asks the machine for one — any one — and requires it of the
+/// parameters, which is precisely the assignment production makes and the one
+/// place a synthetic interface list cannot stand in.
+///
+/// Passive: `NWPathMonitor` reads the system's own path state and sends nothing.
+/// A host that lists no interface at all cannot exercise a pin, and this says so
+/// rather than passing while asserting nothing.
+@Test func requiringAnInterfaceTheFrameworkListsIsAppliedToTheParameters() async throws {
+    let listed = await HostInterfaces.availableInterfaces(within: .milliseconds(500))
+    let interface = try #require(
+        listed.first,
+        "this host lists no available network interface, so the pin cannot be exercised")
+    let pin = WiFiPathPin.interface(
+        HostInterfaceAddress(interfaceName: interface.name, address: "192.168.200.2"),
+        deviceSubnet: "192.168.200")
+    #expect(pin.tcpParameters(requiring: interface).requiredInterface == interface)
+}
+
+/// Network.framework's own interface list is the only source of `NWInterface`
+/// values, and a name it does not list must resolve to nil promptly rather than
+/// holding the connect up — the fallback every loopback test here takes, since
+/// loopback is legitimately absent from that list.
+@Test func anInterfaceNetworkFrameworkDoesNotListResolvesToNilPromptly() async {
+    let clock = ContinuousClock()
+    let began = clock.now
+    let resolved = await HostInterfaces.availableInterface(named: "pocket-nonexistent0",
+                                                          within: .milliseconds(200))
+    #expect(resolved == nil)
+    #expect(clock.now - began < .seconds(2))
+}
+
+/// The iOS shape, which works today and must not regress: the process joined the
+/// network itself, so an interface of its own holds an address on the device's
+/// subnet — and a mesh VPN's utun is up alongside it, exactly the host layout that
+/// broke macOS. The transfer completes, pinned to the interface that can reach the
+/// endpoint.
+@Test func aHostHoldingTheDeviceSubnetAddressStillCompletesTheTransfer() async throws {
+    let golden = try FakeTransport.loadGoldenFixture()
+    let server = try LoopbackServer(payload: golden)
+    defer { server.stop() }
+
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    scriptWIFIStateMachine(on: t)
+    let session = PocketSession(transport: t, sessionKey: "K")
+    try await session.start()
+    await session.setHostInterfaces(hostHolding(("utun4", "100.64.0.2"),
+                                                ("lo0", "127.0.0.1")))
+
+    let data = try await session.downloadOverWiFi(
+        recording,
+        endpointOverride: server.endpoint,
+        joiner: RecordingJoiner(shouldFail: false),
+        readiness: fastReadiness)
+
+    #expect(data == golden)
+    await session.stop()
+    var reported: [String] = []
+    for await event in session.events {
+        if case .wifiConnectPath(let line) = event { reported.append(line) }
+    }
+    #expect(reported.contains {
+        $0.contains("will require lo0") && $0.contains("127.0.0.1 on the device's 127.0.0.0/24")
+    })
+    // No failure, so no transition dump — the verbose line is for failures.
+    #expect(!reported.contains { $0.contains("states:") })
+}
+
+/// Redaction. The message has to say what it looked at, and these transcripts get
+/// pasted into a public protocol reference: an address on the device's own subnet
+/// is printed in full (that subnet is the recorder's and already written down
+/// here), everything else is reduced to its `/24`.
+@Test func theHostsOwnAddressesAreReducedToSubnetsExceptOnTheDevicesOwn() {
+    let summary = WiFiPathPin.summarize(
+        [HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2"),
+         HostInterfaceAddress(interfaceName: "utun4", address: "100.64.0.2"),
+         HostInterfaceAddress(interfaceName: "en1", address: "10.0.1.23")],
+        deviceSubnet: "192.168.200")
+    #expect(summary == "en0 192.168.200.2, utun4 100.64.0.x, en1 10.0.1.x")
+    #expect(WiFiPathPin.summarize([], deviceSubnet: "192.168.200") == "no IPv4 address at all")
 }
 
 /// The third story the device can tell, and the one that made the earlier
@@ -712,7 +1006,11 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     #expect(detail.contains("wifi tcp connect"))
     #expect(detail.contains("the device reported its WiFi off (MCU&WIFIS&0)"))
     #expect(detail.contains("that is the device's doing, not a credential this host holds"))
-    #expect(detail.contains("The access point's lifetime is what to spend less of"))
+    // The device itself said its AP had gone, which is the one verdict where the
+    // lifetime is the subject — and it is now stated as a measurement rather than
+    // as this failure's presumed cause.
+    #expect(detail.contains("The access point's lifetime is measured, not a mystery"))
+    #expect(detail.contains("about 59 s"))
     // Emphatically NOT the credential guidance: the device's own report rules it
     // out, and a confident wrong cause is worse than a bare error.
     #expect(!detail.contains("Forget"))
@@ -720,26 +1018,54 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     await session.stop()
 }
 
-/// The three stories must read differently — telling them apart is the point —
-/// and the two access-point-lifetime ones must never reach for the credential
-/// repair, which is the mistake this type exists to prevent.
-@Test func theConnectDiagnosisSeparatesAccessPointLifetimeFromCredentials() {
-    let lifetime: [WiFiConnectDiagnosis] = [.associatedThenUnreachable, .accessPointClosedItself]
-    let credentials = WiFiJoinDiagnosis.allCases.map { WiFiConnectDiagnosis.nothingEverJoined($0) }
-    let texts = (lifetime + credentials).map { $0.guidance(ssid: "PKT01_EXAMPLE") }
+/// Every verdict must read differently — telling them apart is the point — and
+/// only the two that are consistent with a silently rejected join may reach for
+/// the credential repair, which is the mistake this type exists to prevent. The
+/// access point's lifetime is now told in exactly one place: the verdict where the
+/// device itself reported its WiFi off.
+@Test func theConnectDiagnosisTellsItsVerdictsApart() {
+    let hostSide = WiFiJoinDiagnosis.allCases.map { WiFiConnectDiagnosis.hostNotOnTheAccessPoint($0) }
+    let deviceSide = WiFiJoinDiagnosis.allCases.map { WiFiConnectDiagnosis.nothingEverJoined($0) }
+    let pathSide: [WiFiConnectDiagnosis] = [
+        .pathUnusableFromThisHost(interface: "en0", address: "192.168.200.2",
+                                  waitingReason: "POSIXErrorCode(rawValue: 50): Network is down"),
+        .pathUnusableFromThisHost(interface: "en0", address: "192.168.200.2", waitingReason: nil),
+    ]
+    let all = hostSide + deviceSide + pathSide + [.accessPointClosedItself,
+                                                  .associatedThenUnreachable]
+    let texts = all.map { $0.guidance(ssid: "PKT01_EXAMPLE") }
     #expect(Set(texts).count == texts.count)
 
-    for text in lifetime.map({ $0.guidance(ssid: "PKT01_EXAMPLE") }) {
-        #expect(text.contains("The access point's lifetime is what to spend less of"))
-        #expect(text.contains("Join PKT01_EXAMPLE promptly, stay on it, and run this again"))
-        #expect(!text.contains("Forget"))
-        #expect(!text.contains("saved"))
-    }
-    for text in credentials.map({ $0.guidance(ssid: "PKT01_EXAMPLE") }) {
-        #expect(text.contains("nothing joined PKT01_EXAMPLE"))
-        #expect(text.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+    // The credential repair belongs to the two join-shaped verdicts and nowhere
+    // else — six texts, three comparison outcomes each side.
+    #expect(texts.filter { $0.contains("Forget PKT01_EXAMPLE in Wi-Fi settings") }.count
+            == hostSide.count + deviceSide.count)
+    // The lifetime story is told once, where the device said its AP had gone.
+    #expect(texts.filter { $0.contains("The access point's lifetime is measured") }.count == 1)
+
+    for text in hostSide.map({ $0.guidance(ssid: "PKT01_EXAMPLE") }) {
+        #expect(text.contains("THIS HOST is not on PKT01_EXAMPLE"))
+        #expect(text.contains("Join PKT01_EXAMPLE and run this again"))
+        // The point of preferring it to MCU&WIFIS is stated, because it is the
+        // reason three hardware runs read that check and learned nothing.
+        #expect(text.contains("the device reports 2 for any associated client"))
         #expect(!text.contains("The access point's lifetime"))
     }
+    for text in deviceSide.map({ $0.guidance(ssid: "PKT01_EXAMPLE") }) {
+        #expect(text.contains("nothing joined PKT01_EXAMPLE"))
+        #expect(!text.contains("The access point's lifetime"))
+    }
+    // The path verdict names the interface, and either quotes Network.framework's
+    // reason or says outright that it gave none — which is itself the signature of
+    // its path evaluation failing.
+    let quoted = pathSide[0].guidance(ssid: "PKT01_EXAMPLE")
+    #expect(quoted.contains("en0 holds 192.168.200.2"))
+    #expect(quoted.contains("Network.framework's last reason for not proceeding was: "
+                            + "POSIXErrorCode(rawValue: 50): Network is down"))
+    #expect(!quoted.contains("Forget"))
+    let silent = pathSide[1].guidance(ssid: "PKT01_EXAMPLE")
+    #expect(silent.contains("Network.framework never gave a reason at all"))
+    #expect(silent.contains("as distinct from a refused connect (immediate)"))
 }
 
 // MARK: - The keepalive spans the join itself

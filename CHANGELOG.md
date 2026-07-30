@@ -15,6 +15,54 @@ notes for a release before upgrading.
 
 ### Fixed
 
+- **A failed Wi-Fi TCP connect threw away the one value that could explain it.**
+  `NWConnection`'s `.waiting(NWError)` carries `Network.framework`'s own reason for
+  not being able to use the path, and the connect's state handler discarded it
+  (`default: break // .setup / .preparing / .waiting — keep waiting`). A failing run
+  could therefore only ever report `wifi tcp connect timed out after 30.0 seconds`,
+  which is precisely why the cause of the macOS failure was proposed three times
+  and eliminated on hardware three times. Every non-terminal state is now recorded;
+  the most recent `.waiting` reason goes into the thrown message — with its POSIX
+  code, because `ENETDOWN (50)` is a path with no usable route while
+  `EHOSTUNREACH (65)` is a route with nothing on the far end — and the whole
+  transition sequence goes to the new `DeviceEvent.wifiConnectPath`, which
+  `pocket-cli` prints. Independent of the fix below, and worth having whatever any
+  future failure turns out to be.
+
+- **The Wi-Fi TCP connect named no interface, so `Network.framework` was free to
+  choose one that cannot reach the recorder.** `NWConnection(to:using: .tcp)` uses
+  default parameters, and the framework runs its own path evaluation rather than
+  simply following the BSD route table. The recorder's access point provides no
+  internet, and a host running a mesh VPN carries a `utun` holding a default route
+  — so the framework can select, or wait indefinitely for, a path that cannot reach
+  `192.168.200.1`. A silent 30 s timeout with no error delivered to the caller is
+  the signature of exactly that, as distinct from a refused connect (immediate) or
+  an unreachable host (fast). It is also why iOS worked and macOS did not: on iOS
+  the app joins with `NEHotspotConfiguration`, so the path belongs to the process,
+  while on macOS the join is external and nothing identified the interface.
+
+  The device's address is a fixed constant on a directly-connected `/24`, so this
+  host's own address on that subnet identifies the right interface unambiguously.
+  `getifaddrs` finds it and the connection then requires that interface
+  (`NWParameters.requiredInterface`) and prohibits the classes it provably is not.
+  `requiredInterface` rather than `requiredLocalEndpoint` because that is what
+  measurement showed to be enforced on this SDK — the latter was ignored outright,
+  including when the address it named belonged to no interface on the machine.
+
+  **Not yet confirmed on hardware.** Both fixes are unit-verified, and the macOS
+  transfer they exist to unblock has not been run since.
+
+- **A Wi-Fi transfer from a host that is not on the access point now says so at
+  once instead of timing out.** No interface holding an address on the device's
+  subnet means this host cannot reach the device, whatever `MCU&WIFIS` reported —
+  and that check is strictly better evidence than `MCU&WIFIS&2`, which the device
+  returns for *any* associated client (hardware-confirmed: a Mac auto-joining a
+  remembered network satisfies it while proving nothing about this process). The
+  error names the SSID to join. `WiFiConnectDiagnosis`'s verdicts were revised to
+  match: a run that reaches `2` and then fails to connect now points at the
+  interface and the path, not at the access point's lifetime, which the 2026-07-29
+  measurement eliminated.
+
 - **Every Wi-Fi transfer from a Mac failed, silently, for as long as the path has
   existed — the keepalive did not cover the join.** `APP&WPING` started only after
   `joiner.join(ssid:passphrase:)` returned. On macOS that join *is* a person:

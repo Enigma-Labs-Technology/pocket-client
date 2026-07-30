@@ -84,6 +84,16 @@ public actor PocketSession {
     /// Bulk chunks are consumed by whoever is transferring; nil means discard.
     private var bulkSink: ((Data) -> Void)?
 
+    /// How the WiFi transfer learns which of this host's interfaces can reach
+    /// the device's access point — see `HostInterfaces` and
+    /// `resolveWiFiPathPin`. Production enumerates the host with `getifaddrs`.
+    ///
+    /// A seam, and the only one that can exist for this: the one thing a
+    /// hermetic test cannot do is give the machine a real Wi-Fi interface on the
+    /// recorder's `192.168.200.0/24`, and the *absence* of such an interface is
+    /// precisely the condition the pre-flight has to get right.
+    var hostInterfaces: HostInterfaceLister = HostInterfaces.system
+
     /// Bulk transfers are exclusive. `request`'s busy guard only covers the
     /// armed window; a transfer spends most of its life consuming bulk data
     /// with no waiter armed, so it needs its own mutual exclusion — otherwise
@@ -193,6 +203,14 @@ public actor PocketSession {
     }
 
     func setBulkSink(_ sink: ((Data) -> Void)?) { bulkSink = sink }
+
+    /// Replaces the interface enumeration the WiFi pre-flight reads. Internal:
+    /// a test's only way to present a host that is — or pointedly is not — on
+    /// the device's subnet. An actor's property cannot be assigned from outside
+    /// it, hence a setter rather than a `var` tests could poke.
+    func setHostInterfaces(_ lister: @escaping HostInterfaceLister) {
+        hostInterfaces = lister
+    }
 
     /// Atomically claims the single transfer slot. Actor isolation makes the
     /// check-and-set indivisible; callers must install their sink without
