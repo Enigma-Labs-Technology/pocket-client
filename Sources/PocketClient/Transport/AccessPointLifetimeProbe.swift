@@ -392,11 +392,14 @@ public struct AccessPointLifetime: Sendable {
         let up = accessPointUpAfter.map(elapsedSecondsText) ?? "never reported up"
         let life = lifetime.map { "\(elapsedSecondsText($0))   (the device reported MCU&WIFIS&0)" }
             ?? "not measured — \(outcomeText)"
+        // Spelled `.some`/`.none` rather than `true`/`false`/`nil`: the latter is
+        // accepted as exhaustive over `Bool?` by some Swift compilers and rejected
+        // by others, and CI caught the difference that a local Xcode did not.
         let closed: String
         switch closeConfirmed {
-        case true:  closed = "sent; the device then reported MCU&WIFIS&0"
-        case false: closed = "sent, but the device did NOT report MCU&WIFIS&0 afterwards"
-        case nil:   closed = "sent; no confirming APP&WIFIS answer, so the close is unconfirmed"
+        case .some(true):  closed = "sent; the device then reported MCU&WIFIS&0"
+        case .some(false): closed = "sent, but the device did NOT report MCU&WIFIS&0 afterwards"
+        case .none:        closed = "sent; no confirming APP&WIFIS answer, so the close is unconfirmed"
         }
         return """
         measured:
