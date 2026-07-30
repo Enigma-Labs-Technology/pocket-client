@@ -144,7 +144,7 @@ ASCII, `&`-delimited, request/response.
 | `APP&WIFIS` | `MCU&WIFIS&<n>` (0 off / 3 AP up / 2 client associated / 1 TCP client connected) | Wi-Fi state query |
 | `APP&WIFI` | `MCU&WIFI&<ssid>&<psk>` (synchronous reply — there is no unsolicited credentials push) | AP credentials query, read-only. **Not to be confused with the forbidden provisioning command `APP&WIFI&CH&…`** |
 | `APP&WIFIO` | `MCU&WIFIO` | **Start the Wi-Fi AP** (`MCU&WIFIS&3` ~114 ms later) |
-| `APP&WPING` | `MCU&WPING` | Wi-Fi-session keepalive. **What it keeps alive is UNVERIFIED**: the BLE session, certainly — that the access point's lifetime is extended with it is an assumption two releases rest on and nobody has measured (open item 3; `pocket-cli probe-ap-lifetime` measures it). (`APP&PING` appears in **no** capture — it is not a real command) |
+| `APP&WPING` | `MCU&WPING` | Wi-Fi-session keepalive. **Extends the access point's lifetime** — measured 2026-07-29: ~59 s unassisted, still up at 180 s with a ping every 10 s ([evidence](#appwping-does-extend-the-access-point-hardware-2026-07-29)). Also keeps the BLE session from idling out. (`APP&PING` appears in **no** capture — it is not a real command) |
 | `APP&U&WIFI` | `MCU&U&WIFI`, then repeat `MCU&U&<size>` | **Modifier, not standalone**: reroutes the upload previously selected by `APP&U&<date>&<ts>` to TCP :8475 |
 | `APP&WIFIC` | `MCU&WIFIC` | Close Wi-Fi session / AP off (official app sends it twice) |
 
@@ -427,49 +427,63 @@ earlier and was gone by the time the transfer ran. The only symptom reaching the
 process was `wifi tcp connect timed out after 30.0 seconds`.
 
 `APP&WPING` therefore starts **before** the join rather than after it, so the
-link (and the AP with it) survives a human-paced association. The exact AP
-lifetime is not measured; it is longer than a programmatic `NEHotspotConfiguration`
-join, which is why the phone path never showed this, and shorter than a minute of
-System Settings.
+link (and the AP with it) survives a human-paced association. The AP lifetime is
+measured in the next section: **~59 s unassisted**, which a person in System
+Settings can easily outlast and a programmatic `NEHotspotConfiguration` join
+never comes close to — which is why the phone path never showed this.
 
-### Does `APP&WPING` extend the access point at all? (UNVERIFIED — the assumption two releases rest on)
+One correction to the table above, given that measurement. `No route to host`
+was read at the time as a possible macOS routing quirk. It almost certainly was
+not: those probes were typed by hand *after* a failed transfer, minutes past the
+~59 s the AP survives, so the device's radio was simply off. macOS does not tear
+down the interface address or the route when an AP vanishes, so the lease and the
+`en0` route stayed in place, looking correct, describing a network that no longer
+existed. ARP went unanswered because there was nothing there to answer. **Host-side
+probes of this AP are only meaningful while something is holding it up** — run
+them against `probe-ap-lifetime --keepalive`, not after a failure.
 
-The paragraph above contains an inference that has never been tested. `APP&WPING`
-is documented in the command table as the "Wi-Fi-session keepalive", and this
-client read that as *extending the access point*. **It may only keep the BLE
-session from idling out.** Nothing in any capture separates the two: the vendor
-app's join is programmatic and fast, so its AP never came close to expiring, and
-the pings in the capture are simply what it sends while waiting.
+### `APP&WPING` does extend the access point (hardware, 2026-07-29)
 
-What forces the question, from hardware on 2026-07-29: a `sync-wifi` run reached
-`MCU&WIFIS&2` — the device itself confirming the host had associated — and the
-TCP connect to `192.168.200.1:8475` still timed out after 30 s. That run was on a
-client that already pinged throughout the join. If the pings extended the AP, it
-should have worked. Two readings survive, with opposite consequences:
+It was worth testing rather than assuming: `APP&WPING` is described in the
+command table only as the "Wi-Fi-session keepalive", and this client read that as
+*extending the access point* when it might have kept nothing but the BLE session
+alive. Two releases rested on the stronger reading. Nothing in any capture
+separates the two, because the vendor app's join is programmatic and fast, so its
+AP never came close to expiring.
 
-- **`APP&WPING` does extend the AP**, and the fault is elsewhere: the device's TCP
-  listener on :8475, or the client's socket code.
-- **`APP&WPING` does not extend the AP**, in which case a manual join cannot work
-  at any human speed however the keepalive is scheduled, and the reasoning behind
-  moving the pinger before the join has to be corrected rather than repeated.
+`probe-ap-lifetime` settles it by bringing the AP up and polling `APP&WIFIS` to
+destruction **with nothing joining it**, so no host-side variable can be mistaken
+for the device's own behaviour. Two runs, identical but for the pings, 1 s poll
+cadence, from the `MCU&WIFIO` ack:
 
-**How to settle it:** `pocket-cli probe-ap-lifetime` brings the AP up with
-`APP&WIFIO`, polls `APP&WIFIS` once a second, and reports when the device takes it
-down — **with no join at all**, so no host-side variable (a stale saved password,
-a slow person in System Settings, macOS auto-joining a remembered network) can be
-mistaken for the device's own behaviour. The keepalive is a flag, so the
-experiment is two runs:
+| | keepalive OFF | keepalive ON (`--ping 10`) |
+|---|---|---|
+| AP up (`MCU&WIFIS&3`) | +0.060 s | +0.059 s |
+| a client associated (`&2`) | +6.644 s | +6.524 s |
+| `APP&WIFIS` polls answered | 57 of 57 | 171 of 171 |
+| `APP&WPING` sent / answered | 0 / 0 | 17 / 17 |
+| **AP lifetime** | **59.189 s** (`MCU&WIFIS&0`) | **still up at the 180 s cap** |
 
-```
-POCKET_SK=… swift run pocket-cli probe-ap-lifetime                # silent baseline
-POCKET_SK=… swift run pocket-cli probe-ap-lifetime --keepalive    # the same, pinging
-```
+**The unassisted access-point lifetime on this device is ~59 s, and `APP&WPING`
+extends it to at least 3× that.** Starting the keepalive before the join is
+therefore correct, and the reasoning in the section above stands.
 
-The difference between the two lifetimes is the answer, and each transcript
-carries the cadence that produced it, every state transition, and absolute
-elapsed times from the `MCU&WIFIO` ack. Paste both here. A negative result
-settles this section just as well as a positive one — and if it is negative, that
-is a correction to record against the fix above, not a detail.
+Both runs picked up an associated client at ~6.5 s that the probe did not create —
+the Mac auto-joining a remembered network. It is reported as a confound, and for a
+single run it is one. Across this pair it is not: the same association arrived at
+the same moment in both, leaving the pings as the only difference. It also shows
+the device holds the AP up for an associated client that never opens a socket —
+state `2` persisted for the full 180 s and never advanced to `1`.
+
+**What this rules out.** The keepalive covers the whole session: it starts on the
+`MCU&WIFIO` ack before any joiner, is handed to the live session, and pings
+through the TCP connect itself. So in the `sync-wifi` run that reached
+`MCU&WIFIS&2` and then timed out connecting to `192.168.200.1:8475`, the access
+point was up, the host was associated, and pings were flowing. **AP lifetime is
+not what fails that transfer.** What remains is the device's TCP listener on
+:8475, or this client's socket code — and the way to tell them apart is to hold
+the AP up with `probe-ap-lifetime --keepalive --cap 300` and, from another shell
+while it runs, try `ping 192.168.200.1` and `nc -vz 192.168.200.1 8475`.
 
 `pocket-cli sync-wifi <date> [count]` remains the instrument for the *other* open
 question — whether a live session will serve a second recording — and it cannot
@@ -504,18 +518,24 @@ answer this one, because everything it does happens downstream of a join.
    recording" or "declined", and whether the device needs a settling period
    between `APP&WIFIC` and the next `APP&WIFIO` beyond reporting `MCU&WIFIS&0`
    (which the client now waits for).
-3. **Does `APP&WPING` extend the access point, or only keep the BLE session
-   alive?** Never measured, and two releases assume the former — see
-   [Does `APP&WPING` extend the access point at all?](#does-appwping-extend-the-access-point-at-all-unverified--the-assumption-two-releases-rest-on).
-   This one *is* blocking for the manual-join (macOS) Wi-Fi path: if the keepalive
-   does not extend the AP, no scheduling of it makes a human-paced join work, and
-   the fix shipped in 0.1.4 is aimed at the wrong thing. Settle it with two runs of
-   `pocket-cli probe-ap-lifetime` — once silent, once `--keepalive` — and record
-   both transcripts. Unlike item 2, this needs no join, no recording, and no
-   transfer, so nothing about the host can confound it.
-   Also unmeasured, and answered by the same transcripts: how long the AP takes to
-   come up (a single capture says ~114 ms) and whether an associated client changes
-   its lifetime.
+3. ~~**Does `APP&WPING` extend the access point, or only keep the BLE session
+   alive?**~~ **ANSWERED 2026-07-29: it extends the AP.** ~59 s unassisted,
+   still up at 180 s with pings — see
+   [`APP&WPING` does extend the access point](#appwping-does-extend-the-access-point-hardware-2026-07-29).
+   The AP comes up ~60 ms after the `MCU&WIFIO` ack (a single capture had said
+   ~114 ms), and an associated client that opens no socket does not shorten its
+   life.
+4. **Why does the TCP connect to `192.168.200.1:8475` time out on macOS even with
+   the AP verifiably up?** Open, and now the only thing between the macOS path and
+   a completed transfer. Item 3 eliminated AP lifetime as the cause, so what is
+   left is the device's listener on :8475 or this client's socket code. Separate
+   them by holding the AP open with `probe-ap-lifetime --keepalive --cap 300` and,
+   from a second shell while it runs, trying `ping 192.168.200.1` then
+   `nc -vz 192.168.200.1 8475`. A failing `ping` is the device's IP stack; a
+   working `ping` with a refused or hanging `nc` means the listener is not open
+   before the `APP&U&…` selection, contradicting the capture's SYN ordering; both
+   working means the defect is ours. Note that this probe never sends the selection
+   commands, which is precisely what makes the second outcome informative.
 
 Everything needed is mapped: auth, GATT, status, inventory, BLE download, Wi-Fi transfer,
 delete, record control (STA/STO/PAU/RESU), live stream, slider query, USB mode,
