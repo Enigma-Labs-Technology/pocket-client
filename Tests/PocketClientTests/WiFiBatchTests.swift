@@ -658,11 +658,19 @@ final class BatchProgressLog: @unchecked Sendable {
 /// recordings 1…N-1. The run stops there, reports what it delivered, names the
 /// recording that stopped it, leaves the rest untouched for the caller to decide
 /// about — and closes the access point.
+///
+/// Recording 2 fails on BOTH of its attempts: once on the reused session, and
+/// again on the fresh one the fallback opens for it. That is what makes this a
+/// genuine stop rather than a fallback — a recording is only ever abandoned after
+/// it has had a session of its own — and it also pins the retry at exactly one:
+/// a run that kept restarting would open a third access point and never stop.
 @Test func aFailureMidBatchKeepsTheEarlierRecordingsAndClosesTheAP() async throws {
     let golden = try FakeTransport.loadGoldenFixture()
-    // The second recording's socket delivers a truncated stream.
+    // The second recording's socket delivers a truncated stream — on the reused
+    // session (connection 2) and again on the restart's own (connection 3).
+    let truncated = Data(golden.prefix(9_000))
     let server = try SequencedLoopbackServer(payload: golden,
-                                             overrides: [2: Data(golden.prefix(9_000))])
+                                             overrides: [2: truncated, 3: truncated])
     defer { server.stop() }
 
     let recordings = wifiBatchRecordings(3)
@@ -695,14 +703,292 @@ final class BatchProgressLog: @unchecked Sendable {
     // The summary a harness would print names the failing recording.
     #expect(result.summary.contains(recordings[1].id.timestamp))
 
-    // The AP did not stay up: the failure aborted the session (SHUT + one
-    // WIFIC) and left the network.
-    #expect(t.sent.filter { $0 == "APP&WIFIC" }.count == 1)
-    #expect(joiner.box.left == 1)
+    // Exactly one restart: two access points, not three, and the run stopped
+    // rather than trying a third time.
+    #expect(t.sent.filter { $0 == "APP&WIFIO" }.count == 2)
+    #expect(t.sent.filter { $0 == selectionFrame(recordings[1]) }.count == 2)
+    // Neither AP stayed up: each failure aborted its session (SHUT + one WIFIC)
+    // and left the network.
+    #expect(t.sent.filter { $0 == "APP&WIFIC" }.count == 2)
+    #expect(joiner.box.left == 2)
     // The exclusive transfer slot came back.
     try await session.beginTransfer()
     await session.endTransfer()
     await session.stop()
+}
+
+// MARK: - A reuse that BREAKS must fall back, exactly as a refused one does
+//
+// Hardware, 2026-07-30 — the first successful macOS Wi-Fi transfer, and the run
+// that exposed this. `sync-wifi <date> 2` delivered recording 1 whole, then:
+//
+//     wifi tcp connect will require en0 …   <- a SECOND connect, no re-join
+//     MCU&WIFIS&1                           <- the device: a TCP client is here
+//     MCU&U&25242                           <- the device announces file 2's length
+//                                           <- NWError 54, connection reset by peer
+//     STOPPED on 20260104103000
+//
+// Two things follow. The device DOES serve a second `APP&U&<date>&<ts>` on a live
+// access point, which was the open question. And the batch stopped with one of
+// two recordings delivered, while its own operator-facing text promised that the
+// worst case was "exactly what `pocket-cli download … wifi` does today, once per
+// file" — a promise it did not keep, because only a refusal *before* the payload
+// phase triggered the fallback and this failure was inside it.
+
+/// The ways a reuse can fail once the device has already served the selection.
+/// All three end the same way — the recording is fetched again on a session of
+/// its own — and the partial bytes never survive.
+enum BrokenReuse: String, CaseIterable, Sendable {
+    /// What hardware did: the stream ends with nothing delivered.
+    case resetBeforeAnyByte
+    /// A reset partway through, so a file destination holds a partial write that
+    /// must not be published and must not be left behind.
+    case resetAfterAPartialWrite
+    /// The announced count arrives and the integrity check rejects it. A failure
+    /// inside `finalize` rather than on the wire, and the batch must treat it the
+    /// same: this recording has still never had a session of its own.
+    case completeButNotAnMP3
+}
+
+/// **The invariant.** A batch never delivers fewer recordings than the same list
+/// transferred one at a time would. Whatever a reused session does to a
+/// recording, that recording still gets the one thing the one-at-a-time path
+/// would have given it — a session opened for it — before the run may give up on
+/// it.
+///
+/// Three recordings; the second one's reused attempt fails in each of the ways a
+/// served-then-broken reuse can fail, and the restart's own attempt succeeds.
+/// Reverting the `.broke` arm of the fallback stops this run on recording 2 with
+/// one of three delivered, which is the defect verbatim.
+@Test(arguments: BrokenReuse.allCases)
+func aBatchNeverDeliversFewerRecordingsThanOneAtATimeWould(_ shape: BrokenReuse) async throws {
+    let golden = try FakeTransport.loadGoldenFixture()
+    let broken: Data
+    switch shape {
+    case .resetBeforeAnyByte:      broken = Data()
+    case .resetAfterAPartialWrite: broken = Data(golden.prefix(9_000))
+    case .completeButNotAnMP3:     broken = Data(repeating: 0x41, count: FakeTransport.goldenSize)
+    }
+    // Connection 2 is recording 2 on the REUSED session; connection 3 is the
+    // fresh session the fallback opens for it, and serves the real payload.
+    let server = try SequencedLoopbackServer(payload: golden, overrides: [2: broken])
+    defer { server.stop() }
+
+    let recordings = wifiBatchRecordings(3)
+    let t = FakeTransport()
+    scriptWiFiBatchConversation(on: t, recordings: recordings)
+    scriptHealthyWIFIStateMachine(on: t)
+    let session = PocketSession(transport: t, sessionKey: "K")
+    try await session.start()
+
+    let joiner = RecordingJoiner(shouldFail: false)
+    let result = try await session.downloadOverWiFi(recordings,
+                                                    endpointOverride: server.endpoint,
+                                                    joiner: joiner,
+                                                    readiness: fastReadiness)
+
+    // Every recording arrived, byte-identically. This is the whole requirement.
+    #expect(result.isComplete)
+    #expect(result.stopped == nil)
+    #expect(result.delivered.map(\.recording) == recordings)
+    #expect(result.delivered.allSatisfy { $0.data == golden })
+
+    // And it is reported as what it was: the device served the second selection,
+    // the transfer broke, the recording was re-fetched on its own session.
+    #expect(result.delivered[0].sessionUse == .openedSession)
+    #expect(result.delivered[2].sessionUse == .ownSession)
+    let interruptions = result.reuseInterruptions
+    #expect(interruptions.count == 1)
+    #expect(interruptions.first?.bytesDiscarded == (shape == .resetAfterAPartialWrite
+                                                    ? 9_000
+                                                    : (shape == .completeButNotAnMP3
+                                                        ? FakeTransport.goldenSize : 0)))
+    // Never a refusal: the device did not decline anything here, and calling this
+    // a refusal would misreport the one finding hardware has actually produced.
+    #expect(result.refusals.isEmpty)
+    #expect(result.didAttemptReuse)
+    #expect(!result.didReuseSession)
+    #expect(result.reuseVerdict == .servedThenBroke(
+        interruption: interruptions[0].interruption,
+        bytesDiscarded: interruptions[0].bytesDiscarded))
+
+    // One restart, one extra join, one extra access point — and no third attempt.
+    #expect(joiner.box.joined.count == 3)
+    #expect(joiner.box.left == 3)
+    #expect(t.sent.filter { $0 == "APP&WIFIO" }.count == 3)
+    #expect(t.sent.filter { $0 == selectionFrame(recordings[1]) }.count == 2)
+    try await session.beginTransfer()
+    await session.endTransfer()
+    await session.stop()
+}
+
+/// The distinction the recovery has to draw: a reuse that broke *after* a partial
+/// write leaves bytes on disk, and they must not be published as a recording, must
+/// not be left where a later run mistakes one for a finished download, and must
+/// not be prepended to the retry.
+///
+/// The file destination is where this is observable — the partial goes to a
+/// dot-prefixed `.partial-<uuid>` companion — so the directory listing at the end
+/// is the assertion: three recordings, nothing else, each byte-identical to the
+/// golden fixture.
+@Test func aPartialWriteFromABrokenReuseIsDiscardedAndNeverPublished() async throws {
+    let golden = try FakeTransport.loadGoldenFixture()
+    let server = try SequencedLoopbackServer(payload: golden,
+                                             overrides: [2: Data(golden.prefix(9_000))])
+    defer { server.stop() }
+    let dir = try makeScratchDirectory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let recordings = wifiBatchRecordings(3)
+    let t = FakeTransport()
+    scriptWiFiBatchConversation(on: t, recordings: recordings)
+    scriptHealthyWIFIStateMachine(on: t)
+    let session = PocketSession(transport: t, sessionKey: "K")
+    try await session.start()
+
+    let result = try await session.downloadOverWiFi(
+        recordings,
+        into: .files { dir.appendingPathComponent("\($0.id.timestamp).mp3") },
+        endpointOverride: server.endpoint,
+        joiner: RecordingJoiner(shouldFail: false),
+        readiness: fastReadiness)
+
+    #expect(result.isComplete)
+    #expect(result.reuseInterruptions.first?.bytesDiscarded == 9_000)
+    // The recording that broke is whole — 9000 partial bytes did not become a
+    // prefix of it, and the retry started from byte zero.
+    for recording in recordings {
+        let file = dir.appendingPathComponent("\(recording.id.timestamp).mp3")
+        #expect(try Data(contentsOf: file) == golden)
+    }
+    // Exactly three files. `contentsOfDirectory(atPath:)` lists dot-files too, so
+    // a surviving `.<name>.partial-<uuid>` companion would show up here.
+    #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
+            == recordings.map { "\($0.id.timestamp).mp3" }.sorted())
+    await session.stop()
+}
+
+// MARK: - The verdict must not contradict the log
+//
+// The 2026-07-30 transcript printed
+//
+//     INCONCLUSIVE — no recording was ever asked to reuse a session
+//
+// immediately below a log of a second selection being served on one. Reuse was
+// credited only off DELIVERED recordings, and the recording that carried the
+// attempt was the one the run stopped on — so the most informative outcome the
+// experiment can produce was the one outcome it could not report. An experiment
+// whose purpose is learning what happens when reuse fails cannot credit reuse
+// only when it succeeds.
+
+/// A reuse attempt on the recording the run stopped on is still a reuse attempt,
+/// and the run must say so. Recording 2 breaks on the reused session, gets its
+/// fresh session, breaks again, and the run stops — so `delivered` holds nothing
+/// but recording 1's `.openedSession`, which is exactly the shape that used to
+/// read as "never asked".
+@Test func aReuseAttemptOnTheRecordingTheRunStoppedOnIsStillReported() async throws {
+    let golden = try FakeTransport.loadGoldenFixture()
+    // Both of recording 2's attempts deliver nothing: the reused one and the
+    // fresh one the fallback opens for it.
+    let server = try SequencedLoopbackServer(payload: golden,
+                                             overrides: [2: Data(), 3: Data()])
+    defer { server.stop() }
+
+    let recordings = wifiBatchRecordings(2)
+    let t = FakeTransport()
+    scriptWiFiBatchConversation(on: t, recordings: recordings)
+    scriptHealthyWIFIStateMachine(on: t)
+    let session = PocketSession(transport: t, sessionKey: "K")
+    try await session.start()
+
+    let result = try await session.downloadOverWiFi(recordings,
+                                                    endpointOverride: server.endpoint,
+                                                    joiner: RecordingJoiner(shouldFail: false),
+                                                    readiness: fastReadiness)
+
+    // The run did stop, and only recording 1 was delivered — the 2026-07-30 shape.
+    #expect(result.delivered.map(\.recording) == [recordings[0]])
+    let stopped = try #require(result.stopped)
+    #expect(stopped.recording == recordings[1])
+    // Reading `delivered` alone finds nothing but `.openedSession`, which is why
+    // the finding has to ride on the stop.
+    #expect(result.delivered.map(\.sessionUse) == [.openedSession])
+    if case .restartedAfterReuseBroke = try #require(stopped.sessionUse) {} else {
+        Issue.record("the stop should carry the reuse attempt, got \(String(describing: stopped.sessionUse))")
+    }
+
+    // And therefore the verdict is about what the device did, not about a
+    // question nobody asked.
+    #expect(result.didAttemptReuse)
+    #expect(result.reuseInterruptions.count == 1)
+    if case .servedThenBroke = result.reuseVerdict {} else {
+        Issue.record("expected servedThenBroke, got \(result.reuseVerdict)")
+    }
+    #expect(result.reuseVerdict != .notAttempted(stoppedOn: recordings[1].id.timestamp))
+    await session.stop()
+}
+
+/// The verdict prose for the run hardware actually produced, checked as text
+/// because text is what gets pasted into the protocol reference. It has to say
+/// both halves — the device served it, and the transfer then failed — because
+/// either half alone is a different (and wrong) finding.
+@Test func theVerdictSaysAReuseWasServedAndThenFailed() throws {
+    let recordings = wifiBatchRecordings(2)
+    let result = WiFiBatchResult(
+        delivered: [WiFiRecordingOutcome(recording: recordings[0], sessionUse: .openedSession,
+                                         byteCount: 30_282, data: nil),
+                    WiFiRecordingOutcome(
+                        recording: recordings[1],
+                        sessionUse: .restartedAfterReuseBroke(
+                            interruption: "Connection reset by peer", bytesDiscarded: 0),
+                        byteCount: 25_242, data: nil)],
+        stopped: nil)
+
+    #expect(result.reuseVerdict == .servedThenBroke(interruption: "Connection reset by peer",
+                                                    bytesDiscarded: 0))
+    let text = result.reuseVerdictText(elapsed: .seconds(12))
+    #expect(text.contains("THE DEVICE SERVED A SECOND SELECTION ON A LIVE SESSION, AND THE "
+                          + "TRANSFER THEN FAILED."))
+    #expect(text.contains("settles the older question in the POSITIVE: the device does NOT "
+                          + "refuse reuse"))
+    #expect(text.contains("Connection reset by peer"))
+    // The invariant, restated where the operator reads it.
+    #expect(text.contains("delivered every recording a one-at-a-time sync would have"))
+    // The thing only hardware can settle, named as open rather than guessed at.
+    #expect(text.contains("Whether the failure is avoidable at all is the open question now"))
+    // And never the two verdicts this is not.
+    #expect(!text.contains("INCONCLUSIVE"))
+    #expect(!text.contains("REFUSED"))
+    // Both recordings arrived, so the summary must not read as a loss either.
+    #expect(result.summary.contains("the device served a second selection on a live session and "
+                                    + "the transfer then failed"))
+}
+
+/// The honest inconclusive: nothing was ever asked, and the reason it was not
+/// decides what the operator is told. A run that stopped on its first recording
+/// must not be answered with "run this again with two or more recordings" — they
+/// passed two.
+@Test func anInconclusiveVerdictSaysWhichKindOfInconclusiveItIs() throws {
+    let recordings = wifiBatchRecordings(2)
+    let stoppedFirst = WiFiBatchResult(
+        delivered: [],
+        stopped: WiFiBatchStop(recording: recordings[0], sessionUse: .openedSession,
+                               reason: "wifi tcp connect timed out", error: nil,
+                               remaining: [recordings[1]]))
+    #expect(stoppedFirst.reuseVerdict
+            == .notAttempted(stoppedOn: recordings[0].id.timestamp))
+    let stoppedText = stoppedFirst.reuseVerdictText(elapsed: .seconds(30))
+    #expect(stoppedText.contains("before a second recording could be asked"))
+    #expect(!stoppedText.contains("two or more transferable recordings"))
+
+    // A single-recording run, which genuinely cannot exercise reuse at all.
+    let onlyOne = WiFiBatchResult(
+        delivered: [WiFiRecordingOutcome(recording: recordings[0], sessionUse: .openedSession,
+                                         byteCount: 1, data: nil)],
+        stopped: nil)
+    #expect(onlyOne.reuseVerdict == .notAttempted(stoppedOn: nil))
+    #expect(onlyOne.reuseVerdictText(elapsed: .seconds(1))
+        .contains("two or more transferable recordings"))
 }
 
 /// A `.emptyRecording` is a fact about the recording, not a refusal: restarting
@@ -775,7 +1061,7 @@ final class BatchProgressLog: @unchecked Sendable {
 // class of failure would explain itself. One release later a hardware `sync-wifi`
 // run printed, in full:
 //
-//     STOPPED on 20260728003752: wifi tcp connect timed out after 30.0 seconds
+//     STOPPED on 20260105093000: wifi tcp connect timed out after 30.0 seconds
 //
 // — because the batch path rendered the raw error while only the single-recording
 // path enriched it. The feature built to prevent that confusion did not reach the
@@ -840,11 +1126,17 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
 
 /// And the failure that actually happened on 2026-07-28, in the path that
 /// happened to run it: the device reported a client AND this host holds an address
-/// on the endpoint's subnet, so the credentials, the association and the access
-/// point's lifetime are all settled. The batch must print neither the
-/// stale-password guidance nor the lifetime one — a diagnosis that confidently
-/// names an eliminated cause costs more than a bare error — and must name the
-/// interface and whatever reason Network.framework gave instead.
+/// on the endpoint's subnet, on a running link, with nothing contradicting it. The
+/// batch must print neither the stale-password guidance nor the lifetime one — a
+/// diagnosis that confidently names an eliminated cause costs more than a bare
+/// error — and must name the interface and whatever reason Network.framework gave
+/// instead.
+///
+/// It must also not overclaim in the other direction, which is what it did until
+/// 2026-07-30: an address on the device's subnet was reported as settling the
+/// association, the credentials and the access point's lifetime, "because a device
+/// that had closed its AP would not still be leasing this address". macOS keeps
+/// the address after disassociating, so all three claims were unfounded.
 @Test func aBatchBlamesThePathNotCredentialsOrLifetimeWhenThisHostIsOnTheSubnet() async throws {
     let recordings = wifiBatchRecordings(2)
     let t = FakeTransport()
@@ -862,7 +1154,9 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
 
     let stopped = try #require(result.stopped)
     #expect(stopped.reason.contains("wifi tcp connect"))
-    #expect(stopped.reason.contains("this host IS on the device's subnet (lo0 holds 127.0.0.1)"))
+    #expect(stopped.reason.contains("this host is CONFIGURED to reach the device directly "
+                                    + "(lo0 holds 127.0.0.1 on the device's subnet, and its link "
+                                    + "is running)"))
     // The reason the old handler discarded, in the line a batch actually prints.
     #expect(stopped.reason.contains("Network.framework's last reason:"))
     #expect(stopped.reason.contains("Connection refused"))
@@ -870,6 +1164,9 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
     #expect(!stopped.reason.contains("Forget"))
     #expect(!stopped.reason.contains("The access point's lifetime"))
     #expect(!stopped.reason.contains("never reported a client on its AP"))
+    // And so is every clause that read an address as proof of an association.
+    #expect(!stopped.reason.contains("settled and out of the picture"))
+    #expect(!stopped.reason.contains("would not still be leasing"))
     await session.stop()
 }
 

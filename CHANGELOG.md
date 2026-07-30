@@ -13,7 +13,111 @@ notes for a release before upgrading.
 
 ## [Unreleased]
 
+### Changed
+
+- **Source-breaking for exhaustive switches: `WiFiSessionUse` gained
+  `.restartedAfterReuseBroke(interruption:bytesDiscarded:)`.** It records a reuse
+  the device **served** and that then failed mid-transfer — a distinct finding
+  from `.restartedSession`, which is a refusal *before* any payload byte. A
+  `switch` over `WiFiSessionUse` with no `default:` will no longer compile.
+
+- **`WiFiBatchStop` gained `sessionUse`,** so the recording a run stopped on
+  carries how it got its access point. Additive: the initialiser parameter is
+  defaulted to `nil`. `WiFiBatchResult` gained `sessionUses`, `didAttemptReuse`,
+  `reuseInterruptions`, `reuseVerdict` and `reuseVerdictText(elapsed:)`, and its
+  `refusals` and `didReuseSession` now read the stop as well as the delivered
+  recordings — see the verdict fix below for why that is a correction and not a
+  convenience.
+
+- **Source-breaking for exhaustive switches: `DeviceEvent` gained
+  `.wifiConnectPath(String)`.** `DeviceEvent` is public, so a `switch` over it
+  with no `default:` will no longer compile. Adding a `default:` (or a case for
+  it) is the whole fix; nothing else about the enum changed. The event carries the
+  Wi-Fi connect's interface decision and, on a failure, every `NWConnection` state
+  it passed through.
+
+- **`WiFiReadiness` gained `hostAddressWait`** (default 3 s), the Wi-Fi
+  pre-flight's patience for an address that has not arrived yet. Additive: the new
+  initialiser parameter is defaulted, so existing call sites are unaffected.
+
 ### Fixed
+
+- **A batch could deliver fewer recordings than transferring the same list one at
+  a time would — the defect the first successful macOS Wi-Fi transfer exposed.**
+  On 2026-07-30, `sync-wifi <date> 2` delivered recording 1 whole and then, on
+  the still-live access point with no second join prompt, the device accepted a
+  second TCP connection, reported `MCU&WIFIS&1`, announced the next file's length
+  as `MCU&U&25242` — and the stream reset (`ECONNRESET`). The run stopped with one
+  of two recordings delivered, while its own operator-facing text promised the
+  worst case was "exactly what `pocket-cli download … wifi` does today, once per
+  file".
+
+  The fallback existed and did not fire. `transferOneRecording` classified a reuse
+  failure as recoverable only when it happened *before* the payload phase — the
+  gap poll, the TCP connect, the selection, the reroute — on the reasoning that a
+  restart is safe only if no byte has flowed. The reset happened *inside* the
+  payload phase, so it returned `.failed` and stopped the batch. **The reasoning
+  was inverted**: a recording that broke on a session another recording opened has
+  not yet had the one thing the one-at-a-time path would have given it, which is a
+  session opened for it. Now every way a reuse can fail falls back the same way —
+  any partial bytes are discarded, `APP&SHUT` + `APP&WIFIC` tears the session
+  down, and the recording is fetched again from byte zero on a fresh session, once.
+  A refusal and an interruption remain *reported* differently, because they answer
+  different questions about the device; they are *recovered* identically, because
+  the recording does not care which it was.
+
+  The invariant now has a test that fails if it stops being true, across every
+  shape a served-then-broken reuse can take: a reset before any byte, a reset after
+  a partial write, and a complete payload that fails the integrity check.
+
+- **A partial write from a broken reuse could have been left where a later run
+  would find it.** It never reached the destination — the streaming sink writes to
+  a `.<name>.partial-<uuid>` companion and publishes only after both integrity
+  checks — but the recovery above makes the case reachable rather than terminal,
+  so the discard is now explicit at that exit and asserted by a test that lists the
+  directory afterwards.
+
+- **The `sync-wifi` verdict contradicted its own transcript.** The 2026-07-30 run
+  printed `INCONCLUSIVE — no recording was ever asked to reuse a session`
+  immediately below a log of a second selection being served on one. Reuse was
+  credited only from *delivered* recordings, and the recording carrying the attempt
+  was the one the run stopped on — so the most informative outcome an experiment
+  about failure can produce was the one outcome it could not report. The stop now
+  carries its session use, every reuse question reads it, and the verdict has four
+  terms instead of three, because serving a second selection and completing a
+  transfer over one turned out to be separate facts. It now says, for that exact
+  run: *the device served a second selection on a live session, and the transfer
+  then failed*. The verdict moved into the library beside
+  `AccessPointLifetime.verdictText` so it can be tested; an executable target
+  cannot be.
+
+- **The Wi-Fi pre-flight read a stale address as proof of an association, and said
+  so in three confident sentences that were all wrong.** A connect failure from a
+  host holding an address on the device's `/24` reported that "the association and
+  the credentials are settled and out of the picture, and so is the access point's
+  lifetime, because a device that had closed its AP would not still be leasing this
+  address". macOS keeps the address, the netmask, the route and the ARP entry when
+  a Wi-Fi interface disassociates, so **every run that has ever joined the recorder
+  leaves behind a configuration that satisfies that check** — and it is most
+  misleading exactly when somebody is testing repeatedly. The address is also not a
+  lease the device is granting, so it says nothing whatever about the access
+  point's lifetime. Hardware, 2026-07-30: `networksetup -getairportnetwork en0`
+  reported *not associated* while `ifconfig en0` still showed `192.168.200.2`.
+
+  The reasoning is deleted rather than reworded. What replaces it is evidence that
+  can contradict an address: `IFF_RUNNING` from the same `getifaddrs` enumeration
+  (the kernel's operational link state, as distinct from the administrative
+  `IFF_UP`), and `ENETDOWN` from `Network.framework` on a connection *required* to
+  use that interface — which cannot mean "the destination is unreachable from here"
+  when the interface holds an address on the destination's own `/24`. `ENETDOWN`
+  was accurate throughout the failing run while this package's prose was not, so
+  where the framework gives a reason it is now preferred to any inference here.
+  Both checks are **one-directional by construction**: they can establish that this
+  host is not associated, and nothing available to this package can establish that
+  it is. Neither is a shell tool and neither reads an SSID —
+  `networksetup -getairportnetwork` is a command-line program with no API behind
+  it, and SSID reads on current macOS are gated behind Location Services, so a
+  check built on one would report "not associated" for a permissions reason.
 
 - **A failed Wi-Fi TCP connect threw away the one value that could explain it.**
   `NWConnection`'s `.waiting(NWError)` carries `Network.framework`'s own reason for
@@ -44,7 +148,7 @@ notes for a release before upgrading.
   The device's address is a fixed constant on a directly-connected `/24`, so this
   host's own address on that subnet identifies the right interface unambiguously.
   `getifaddrs` finds it and the connection then requires that interface
-  (`NWParameters.requiredInterface`) and prohibits the classes it provably is not.
+  (`NWParameters.requiredInterface`), and sets nothing else.
   `requiredInterface` rather than `requiredLocalEndpoint` because that is what
   measurement showed to be enforced on this SDK — the latter was ignored outright,
   including when the address it named belonged to no interface on the machine.
@@ -62,6 +166,21 @@ notes for a release before upgrading.
   match: a run that reaches `2` and then fails to connect now points at the
   interface and the path, not at the access point's lifetime, which the 2026-07-29
   measurement eliminated.
+
+  The refusal is not made on a timing guess. The pre-flight waits
+  `WiFiReadiness.hostAddressWait` for an address that has not arrived, and extends
+  that to the full `timeout` for as long as some interface holds a self-assigned
+  `169.254` address — which means this host associated with an access point and is
+  still being refused a lease, a join trying rather than a host elsewhere. The
+  ceiling is `timeout` either way, so it can never wait longer than the connect it
+  replaced.
+
+- **A host that joined and never got a lease is no longer told to forget the
+  network.** A self-assigned `169.254` address proves the association succeeded,
+  so the password was accepted and DHCP is what failed. That case now has its own
+  verdict naming the right repair — renew the lease — and says explicitly not to
+  forget the network, because re-entering a credential that was accepted costs
+  time and teaches nothing.
 
 - **Every Wi-Fi transfer from a Mac failed, silently, for as long as the path has
   existed — the keepalive did not cover the join.** `APP&WPING` started only after
@@ -90,7 +209,7 @@ notes for a release before upgrading.
 
 - **A batched Wi-Fi run printed the raw failure instead of the diagnosis built for
   it.** `sync-wifi` reported only
-  `STOPPED on 20260728003752: wifi tcp connect timed out after 30.0 seconds` — the
+  `STOPPED on 20260105093000: wifi tcp connect timed out after 30.0 seconds` — the
   join-failure guidance added in the previous release enriched the
   single-recording path only, so the transcript where the confusion actually
   happened never saw it. The batch path now attaches the same diagnosis to a
@@ -108,6 +227,18 @@ notes for a release before upgrading.
   teardown change, and no credential in any of it.
 
 ### Added
+
+- **`ManualHotspotJoiner` warns about Ethernet before the join prompt.** With a
+  wired link carrying this Mac's default route, macOS associates with the
+  recorder's no-internet access point and then silently drops the association,
+  leaving address, netmask, route and ARP entry in place so the host looks joined
+  from every angle this process can see. It cost several hardware rounds to find,
+  and unplugging the cable produced the first successful macOS Wi-Fi transfer. The
+  joiner now asks `NWPathMonitor` whether the default path is wired and, if it is,
+  leads the instructions with `0. UNPLUG ETHERNET FIRST` — above the Wi-Fi steps,
+  which is the only point in the run where it can still be acted on. The
+  instructions are built as a value rather than written straight to stdout so the
+  warning can be tested.
 
 - **A hardware probe for the assumption the last two releases rest on: does
   `APP&WPING` extend the access point, or only keep the BLE session alive?**

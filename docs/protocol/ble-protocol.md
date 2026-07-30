@@ -314,16 +314,41 @@ opening the access point, which is most of what the rotation was for.
 Security note: SK is the root secret for both BLE auth and the Wi-Fi AP password —
 anyone holding SK can join the AP and pull every recording.
 
-### Reusing one AP session for several recordings (UNVERIFIED — never attempted on hardware)
+### Reusing one AP session for several recordings (PARTIALLY ANSWERED on hardware, 2026-07-30)
 
-**The open question.** Step 7 selects a recording with `APP&U&<date>&<ts>`, step 8
-serves it and ends with `MCU&OFF`, and the app then closes the session with
-`APP&WIFIC` ×2. **Nobody has ever issued a second `APP&U&<date>&<ts>` while the
-access point was still up.** The capture this section was decoded from covered a
-single-file sync, so the device's behaviour is genuinely unknown: it may serve a
-second file, refuse, or do something worse. Nothing below is a claim about the
-device — this section records the question, why it matters, and how the client
-asks it safely.
+**The device does serve a second selection on a live access point, and the
+transfer over it then reset.** The first successful macOS Wi-Fi transfer,
+`sync-wifi <date> 2`, delivered recording 1 whole (30282 bytes, announced
+30282) and then, with the access point still up and **no second join prompt**:
+
+```
+[1/2] 20260104101500  100%   trailer after file: 10 bytes
+MCU&OFF                       ← first file complete
+wifi tcp connect will require en0 …   ← a SECOND connect, and no re-join
+MCU&WIFIS&1                   ← the device: a TCP client is connected
+MCU&U&25242                   ← the device announces the SECOND file's length
+                              ← then: NWError 54, connection reset by peer
+```
+
+So the older framing of this section — "nobody has ever issued a second
+`APP&U&<date>&<ts>` while the access point was still up", the device may "serve a
+second file, refuse, or do something worse" — is superseded. The device accepted a
+second TCP connection, accepted a second selection, and announced the length. It
+does **not** refuse reuse.
+
+What is still open is the reset. It arrived after the announcement and before the
+payload completed, and this one run cannot say whether it is device behaviour, a
+consequence of the socket the client opens, or something about the gap between
+`MCU&OFF` and the next connect. Until another run says otherwise the client treats
+it as something to fall back from rather than something to fix.
+
+**The reset must never cost a recording.** In the run above it did: the batch
+stopped with one of two recordings delivered, because only a refusal observed
+*before* the payload phase triggered the fallback. Since 0.1.5 a reuse that breaks
+at any point falls back exactly as a refused one does — the partial bytes are
+discarded, a session is opened for that recording, and it is fetched again from
+byte zero. **A batch never delivers fewer recordings than the same list
+transferred one at a time would.**
 
 **Why it matters.** A session is expensive. Steps 1–5 cost the
 `SHUT → WIFIS → WIFI → WIFIO` handshake plus about **6.5 s for the association
@@ -345,8 +370,7 @@ one-session-per-recording behaviour and never a wedged device:
 3. `APP&WIFIC` ×2 once, at the end.
 
 **What counts as a refusal.** Every one of these is observed *before* a single
-payload byte of the new recording has flowed, which is what makes a clean restart
-safe:
+payload byte of the new recording has flowed:
 
 | Observation | Reading |
 |---|---|
@@ -356,10 +380,19 @@ safe:
 | `MCU&UNKNOWN`, no reply, or an unexpected shape to the second `APP&U&<date>&<ts>` | The device will not accept a second selection. |
 | No `MCU&U&WIFI` for the second `APP&U&WIFI` | It accepted the selection but will not reroute it to the socket again. |
 
-On any of those the client sends `APP&SHUT` + `APP&WIFIC`, leaves the network,
-and opens a fresh session for that same recording — and then **stops attempting
-reuse for the rest of the run**, because a doomed attempt plus a teardown per
-recording is worse than not trying.
+**What counts as an interruption.** Anything that fails *after* the device has
+served the selection — the reset above, a truncated stream, a payload that fails
+the integrity check. It is a different finding (the device did serve it) but it
+gets the same recovery, because the recording has still never had a session of its
+own. Any bytes already written are discarded: the client streams to a
+`.<name>.partial-<uuid>` companion and removes it, so a broken reuse can never
+publish a truncated file or leave one where a later run would mistake it for a
+finished download.
+
+On any refusal or interruption the client sends `APP&SHUT` + `APP&WIFIC`, leaves
+the network, and opens a fresh session for that same recording — exactly one retry
+— and then **stops attempting reuse for the rest of the run**, because a doomed
+attempt plus a teardown per recording is worse than not trying.
 
 Two deliberate non-refusals:
 
@@ -511,6 +544,52 @@ Holding the AP up with `probe-ap-lifetime --keepalive --cap 300` and trying
 `nc -vz 192.168.200.1 8475` from another shell while it runs remains the way to
 cross-check the listener from outside this client.
 
+### Ethernet blocks the join, and a stale address hides it (hardware, 2026-07-30)
+
+That next run happened, and neither socket defect was the whole story. **A network
+cable was.** With a wired link carrying the Mac's default route, macOS associates
+with the recorder's no-internet access point and then **drops the association**,
+while leaving the entire layer-3 configuration in place — address, netmask, route,
+and the ARP entry. Unplugging Ethernet made the transfer work on the next attempt.
+
+Two things follow, and the second is the nastier one.
+
+**The host-side evidence lies.** After the association is dropped:
+
+| Probe | Result | What it looks like | What is true |
+|---|---|---|---|
+| `ifconfig en0` | `inet 192.168.200.2` | joined, leased, routable | a leftover the host never cleaned up |
+| `route -n get 192.168.200.1` | `interface: en0` | correct route | a route to nowhere |
+| `arp -an` | an entry for the device | the peer was reachable | a cached entry, not a live one |
+| `networksetup -getairportnetwork en0` | `not associated` | — | **the only host-side probe that told the truth** |
+| `NWConnection` `.waiting` | `ENETDOWN` (POSIX 50) | — | **also true, and delivered to the process** |
+
+This is why the address must never be read as an association. **Every run that has
+ever joined the recorder leaves a configuration behind that satisfies a
+subnet-based pre-flight**, and it is most misleading exactly when somebody is
+testing repeatedly — the address is *always* there by the second attempt. Version
+0.1.4's diagnosis went further and read the address as proof that the access
+point was still up ("a device that had closed its AP would not still be leasing
+this address"); it is not a lease the device grants, and that reasoning was
+removed in 0.1.5.
+
+Two facts can contradict an address, and the client now reads both. `IFF_RUNNING`
+from `getifaddrs` — the kernel's operational link state, as distinct from the
+administrative `IFF_UP` — and `ENETDOWN` on a connection *required* to use that
+interface, which cannot mean "the destination is unreachable from here" when the
+interface holds an address on the destination's own `/24`. Neither is a shell tool
+and neither reads an SSID: `networksetup -getairportnetwork` is a command-line
+program with no API behind it, and SSID reads on current macOS are gated behind
+Location Services, so a check built on one would report "not associated" for a
+permissions reason. **Note both are one-directional**: they can show that the host
+is not associated; nothing available here can show that it is.
+
+**The warning now precedes the join.** `ManualHotspotJoiner` asks
+`NWPathMonitor` whether the default path runs over wired Ethernet and, if it does,
+prints "UNPLUG ETHERNET FIRST" above the Wi-Fi steps — the point in the run where
+it can still be acted on, rather than in a failure report afterwards. This cost
+several hardware rounds to find.
+
 `pocket-cli sync-wifi <date> [count]` remains the instrument for the *other* open
 question — whether a live session will serve a second recording — and it cannot
 answer this one, because everything it does happens downstream of a join.
@@ -534,14 +613,21 @@ answer this one, because everything it does happens downstream of a join.
    "WiFi OTA via BLE", `APP&OTA&WIFI&`, "BLE WiFi OTA requires MCU T22+ and WiFi V10+".
    MCU firmware is encrypted (`AOTA` container, entropy 8.0) — not analyzable offline.
    **Read-only policy: never write to these characteristics (brick risk).**
-2. **Will the device serve a second `APP&U&<date>&<ts>` while its access point is
-   still up?** Never attempted — see
-   [Reusing one AP session for several recordings](#reusing-one-ap-session-for-several-recordings-unverified--never-attempted-on-hardware).
-   Not blocking: the client attempts it and falls back to one session per
-   recording, so the worst case is the pre-existing behaviour. Settle it with
-   `pocket-cli sync-wifi <date> 3` and record the answer, whichever it is.
-   Sub-questions inside it: whether `MCU&U&0` on a reused session means "empty
-   recording" or "declined", and whether the device needs a settling period
+2. ~~**Will the device serve a second `APP&U&<date>&<ts>` while its access point
+   is still up?**~~ **ANSWERED 2026-07-30: yes.** It accepted a second TCP
+   connection with no re-join and announced the next file's length — see
+   [Reusing one AP session for several recordings](#reusing-one-ap-session-for-several-recordings-partially-answered-on-hardware-2026-07-30).
+   **What replaces it: why did the transfer over that reused session reset
+   (`ECONNRESET`) after the announcement?** One observation, so nothing is settled:
+   it may be device behaviour to fall back from, or this client's socket handling.
+   Not blocking — a reuse that breaks now falls back to a session opened for that
+   recording, so a batch cannot deliver fewer recordings than one-at-a-time would.
+   Next: `pocket-cli sync-wifi <date> 3` on macOS with Ethernet unplugged, and read
+   the `session:` lines. Whether the reset repeats, whether it always lands at the
+   same point, and whether the device reports `MCU&WIFIS&0` promptly after the
+   teardown that follows it are all in that transcript.
+   Sub-questions still open inside it: whether `MCU&U&0` on a reused session means
+   "empty recording" or "declined", and whether the device needs a settling period
    between `APP&WIFIC` and the next `APP&WIFIO` beyond reporting `MCU&WIFIS&0`
    (which the client now waits for).
 3. ~~**Does `APP&WPING` extend the access point, or only keep the BLE session
@@ -551,17 +637,16 @@ answer this one, because everything it does happens downstream of a join.
    The AP comes up ~60 ms after the `MCU&WIFIO` ack (a single capture had said
    ~114 ms), and an associated client that opens no socket does not shorten its
    life.
-4. **Why does the TCP connect to `192.168.200.1:8475` time out on macOS even with
-   the AP verifiably up?** Open, and now the only thing between the macOS path and
-   a completed transfer. Item 3 eliminated AP lifetime as the cause, so what is
-   left is the device's listener on :8475 or this client's socket code. Separate
-   them by holding the AP open with `probe-ap-lifetime --keepalive --cap 300` and,
-   from a second shell while it runs, trying `ping 192.168.200.1` then
-   `nc -vz 192.168.200.1 8475`. A failing `ping` is the device's IP stack; a
-   working `ping` with a refused or hanging `nc` means the listener is not open
-   before the `APP&U&…` selection, contradicting the capture's SYN ordering; both
-   working means the defect is ours. Note that this probe never sends the selection
-   commands, which is precisely what makes the second outcome informative.
+4. ~~**Why does the TCP connect to `192.168.200.1:8475` time out on macOS even
+   with the AP verifiably up?**~~ **ANSWERED 2026-07-30: a network cable.** With a
+   wired link holding the default route, macOS associated with the no-internet
+   access point and then dropped the association, leaving the address, route and
+   ARP entry behind so the host looked joined. `ENETDOWN` from `Network.framework`
+   was accurate throughout. Unplugging Ethernet produced the first successful
+   macOS Wi-Fi transfer — see
+   [Ethernet blocks the join, and a stale address hides it](#ethernet-blocks-the-join-and-a-stale-address-hides-it-hardware-2026-07-30).
+   The client now warns before the join prompt and no longer reads an address as
+   proof of an association.
 
 Everything needed is mapped: auth, GATT, status, inventory, BLE download, Wi-Fi transfer,
 delete, record control (STA/STO/PAU/RESU), live stream, slider query, USB mode,

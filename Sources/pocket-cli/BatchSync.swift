@@ -4,15 +4,20 @@
 // per SYNC rather than one per recording.
 //
 // This exists because the interesting part of that feature cannot be tested
-// without a device. Whether the recorder will serve a second
-// `APP&U&<date>&<ts>` while its access point is still up has never been
-// observed: the packet capture the protocol was decoded from covered a
-// single-file sync. `PocketSession.downloadOverWiFi(_ recordings:…)` therefore
-// attempts reuse and falls back to one session per recording the moment the
-// device refuses, and this command's output is how we find out which happened.
+// without a device. On 2026-07-30 it produced the first real answer: the
+// recorder DOES serve a second `APP&U&<date>&<ts>` while its access point is
+// still up, and the transfer over it then reset mid-stream. Whether that reset
+// is avoidable is now the open question.
+//
+// `PocketSession.downloadOverWiFi(_ recordings:…)` attempts reuse and falls back
+// to a session opened for that recording whenever the device refuses it or the
+// transfer over it breaks, so a batch can never deliver fewer recordings than
+// the same list fetched one at a time. This command's output is how we find out
+// which of those happened.
 //
 // So the per-recording `session:` lines below are not progress decoration —
-// they ARE the result. Capture the transcript.
+// they ARE the result, and so is the one under a STOPPED recording. Capture the
+// transcript.
 
 import Foundation
 import PocketClient
@@ -54,6 +59,14 @@ private func sessionUseLine(_ use: WiFiSessionUse) -> String {
     case .restartedSession(let refusal):
         return "RESTARTED — the device would not serve this recording on the live session, "
              + "so it was torn down and reopened.\n              refusal: \(refusal)"
+    case .restartedAfterReuseBroke(let interruption, let discarded):
+        // The 2026-07-30 shape, and the informative one: the device DID serve
+        // the second selection. Both halves have to be on the line or the
+        // transcript reads as a plain refusal, which it is not.
+        return "RESTARTED — the device SERVED this recording on the live session and the "
+             + "transfer then failed.\n              interruption: \(interruption)"
+             + "\n              \(discarded) partial byte(s) were discarded; the recording was "
+             + "fetched again from byte zero\n              on a session of its own"
     case .ownSession:
         return "OWN       — reuse was already ruled out this run, so this recording "
              + "opened its own session"
@@ -86,10 +99,14 @@ func runWiFiBatchSync(device: PocketDevice, date: String, count: Int) async thro
     \(totalSize) estimated,
       over ONE access-point session instead of one per recording.
 
-      THIS IS THE UNVERIFIED PART. Nobody has issued a second APP&U&<date>&<ts>
-      while the AP was still up, so the device may serve it, refuse it, or do
-      something else. The run attempts reuse and falls back to one session per
-      recording the moment it is refused — the worst case is exactly what
+      THIS IS THE PART HARDWARE IS STILL SETTLING. On 2026-07-30 the device DID
+      serve a second APP&U&<date>&<ts> on a live access point — it took a second
+      TCP connection and announced the next file's length — and the stream then
+      reset mid-transfer. So it does not refuse reuse, and reuse does not yet
+      work. The run attempts it and falls back to a session opened for that
+      recording whenever it is refused OR interrupted, discarding any partial
+      bytes: a batch never delivers fewer recordings than the same list fetched
+      one at a time would, and the worst case is exactly what
       `pocket-cli download … wifi` does today, once per file.
 
       Watch the "session:" line under each recording. That is the experiment.
@@ -130,6 +147,13 @@ func runWiFiBatchSync(device: PocketDevice, date: String, count: Int) async thro
 
     if let stopped = result.stopped {
         print("\n  STOPPED on \(stopped.recording.id.timestamp)")
+        // The recording the run stopped on carries a finding too, and on
+        // 2026-07-30 it carried the only interesting one in the whole run. A
+        // stop that hides it is how that transcript came to print INCONCLUSIVE
+        // under a log of reuse being served.
+        if let use = stopped.sessionUse {
+            print("      session: \(sessionUseLine(use))")
+        }
         // The reason is a paragraph now, not a line: a failed Wi-Fi transfer's
         // diagnosis rides in it. That is the whole point — the 2026-07-28
         // transcript of this command showed `wifi tcp connect timed out after
@@ -146,41 +170,15 @@ func runWiFiBatchSync(device: PocketDevice, date: String, count: Int) async thro
         """)
     }
 
-    // The verdict. Only three things can be said honestly, and which one it is
-    // depends entirely on what the device did.
+    // The verdict itself lives in the library, next to the result it reads and
+    // next to `AccessPointLifetime.verdictText`, because it has been wrong before
+    // and an executable target cannot be tested. Wrapped paragraph by paragraph,
+    // exactly as `probe-ap-lifetime` renders its own.
     print("\nverdict:")
-    if result.didReuseSession {
-        print("""
-          SESSION REUSE WORKS on this firmware.
-            \(result.delivered.count) recording(s) came off the device over \
-        \(result.sessionsOpened) access-point session(s)
-            in \(milliseconds(elapsed)) ms. The device DID serve a second \
-        APP&U&<date>&<ts> while its
-            AP was up — which is what has never been observed before.
-            Promote the capability from `unverified` in docs/protocol/ble-protocol.md
-            and the README, and record this transcript as the evidence.
-        """)
-    } else if let refusal = result.refusals.first {
-        print("""
-          SESSION REUSE IS REFUSED on this firmware.
-            The device would not serve a recording on a live session:
-              \(refusal)
-            The run fell back to one session per recording — \
-        \(result.sessionsOpened) session(s) for
-            \(result.delivered.count) recording(s), in \(milliseconds(elapsed)) ms — \
-        which is exactly the
-            pre-existing behaviour. Nothing was lost and no access point was left up.
-            Record the refusal in docs/protocol/ble-protocol.md: it settles the open
-            question in the negative, which is just as useful an answer.
-        """)
-    } else {
-        print("""
-          INCONCLUSIVE — no recording was ever asked to reuse a session.
-            \(result.delivered.count) recording(s) delivered over \
-        \(result.sessionsOpened) session(s). Reuse is only exercised
-            from the SECOND recording onwards, and only if the first one succeeds,
-            so run this again with two or more transferable recordings.
-        """)
+    for (index, paragraph) in result.reuseVerdictText(elapsed: elapsed)
+        .components(separatedBy: "\n\n").enumerated() {
+        if index > 0 { print("") }
+        print(wrappedForTranscript(paragraph, indent: "  "))
     }
     print("\n  \(result.summary)")
 }

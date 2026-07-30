@@ -632,6 +632,49 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     return { held }
 }
 
+/// The seam above is synthetic by necessity, so the real enumeration needs one
+/// assertion of its own or the flag could be read from the wrong field and no test
+/// would notice.
+///
+/// Loopback is the only interface every machine has and the only one whose state
+/// is knowable without a radio: `lo0` is always up, always running, and always
+/// holds `127.0.0.1`. That is enough to prove `IFF_RUNNING` is being read at all
+/// and is not, say, `IFF_UP` a second time — which would make the whole
+/// stale-address check answer "running" forever.
+@Test func theSystemEnumerationReportsLoopbackAsRunningWithItsRealAddress() throws {
+    let held = HostInterfaces.systemIPv4Addresses()
+    let loopback = try #require(held.first { $0.interfaceName == "lo0" },
+                                "every machine has lo0")
+    #expect(loopback.address == "127.0.0.1")
+    #expect(loopback.linkIsRunning)
+}
+
+/// The wired-default-route probe reads `NWPathMonitor`, so what it answers on any
+/// given machine is that machine's business — but it must answer, promptly, and
+/// never hang a transfer waiting for a monitor that has nothing to say.
+@Test func theWiredDefaultRouteProbeAnswersWithinItsBound() async throws {
+    let clock = ContinuousClock()
+    let started = clock.now
+    _ = await HostInterfaces.defaultPathIsWired(within: .milliseconds(200))
+    // Generous against CI scheduling, and still far short of the 30 s connect it
+    // sits in front of.
+    #expect(clock.now - started < .seconds(3))
+}
+
+/// The same seam with `IFF_RUNNING` stated per interface — the one piece of
+/// evidence that can contradict an address, and the condition macOS leaves behind
+/// when a Wi-Fi interface disassociates but keeps its layer-3 configuration.
+/// (Internal, not private: WiFiBatchTests presents the same hosts.)
+func hostHoldingLinks(
+    _ addresses: (interface: String, address: String, running: Bool)...
+) -> HostInterfaceLister {
+    let held = addresses.map {
+        HostInterfaceAddress(interfaceName: $0.interface, address: $0.address,
+                             linkIsRunning: $0.running)
+    }
+    return { held }
+}
+
 /// The macOS shape of the failure, and the pre-flight that ends it: no interface
 /// on this host holds an address on the device's subnet, so this host is not on
 /// the access point — a statement about *this process*, which `MCU&WIFIS&2` is
@@ -685,12 +728,18 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     await session.stop()
 }
 
-/// The counterpart, and the one that carries the value of this whole change: this
-/// host DOES hold an address on the endpoint's subnet, so the association and the
-/// credentials are settled — and so is the access point's lifetime, because a
-/// device that had closed its AP would not still be leasing the address. What is
-/// left is the path, and the failure now quotes the reason Network.framework gave
-/// for not being able to take it.
+/// The counterpart: this host DOES hold an address on the endpoint's subnet, on a
+/// running link, and nothing observed contradicts it — so what is left is the
+/// path, and the failure quotes the reason Network.framework gave for not being
+/// able to take it.
+///
+/// What this message must NOT do is overclaim, which for two releases it did: it
+/// declared the association, the credentials and the access point's lifetime all
+/// "settled and out of the picture" on the strength of an address, on the
+/// reasoning that "a device that had closed its AP would not still be leasing
+/// this address". macOS keeps the address after disassociating, so that reasoning
+/// was false and the confident sentence built on it sent a hardware session
+/// looking in the wrong place. Its absence is asserted below.
 ///
 /// The reason is real, not injected: nothing listens on port 1, and a refused
 /// connect on this platform surfaces as `.waiting(ECONNREFUSED)` — a non-terminal
@@ -726,11 +775,168 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     // The interface that reaches the endpoint was chosen, and not the tunnel.
     #expect(detail.contains("lo0 holds 127.0.0.1 on the device's 127.0.0.0/24"))
     #expect(!detail.contains("utun4"))
-    #expect(detail.contains("this host IS on the device's subnet (lo0 holds 127.0.0.1)"))
+    #expect(detail.contains("this host is CONFIGURED to reach the device directly "
+                            + "(lo0 holds 127.0.0.1 on the device's subnet, and its link is "
+                            + "running)"))
     // Neither of the two stories hardware has already eliminated.
     #expect(!detail.contains("Forget"))
     #expect(!detail.contains("The access point's lifetime"))
+    // And none of the three claims an address cannot support. Each of these was
+    // in the shipped text; each was wrong.
+    #expect(!detail.contains("settled and out of the picture"))
+    #expect(!detail.contains("would not still be leasing"))
+    #expect(!detail.contains("the association and the credentials are settled"))
     await session.stop()
+}
+
+// MARK: - Ethernet, warned about before the join rather than after the failure
+//
+// Every macOS Wi-Fi transfer up to 2026-07-30 failed, and the cause turned out to
+// be a network cable. The recorder's access point offers no internet; with a
+// wired link carrying the default route, macOS associates with it and then drops
+// the association, leaving address, netmask, route and ARP entry in place — so
+// the host looks joined from every angle this process can see and nothing reaches
+// the device. Unplugging Ethernet was what made the first transfer work.
+//
+// It cost several hardware rounds to find, so the operator is told at the moment
+// they can act on it: in the join instructions, above the Wi-Fi steps.
+
+/// The instructions are built as a value rather than written straight to stdout
+/// precisely so this can be asserted. The Ethernet paragraph leads, names the
+/// action, and says what it costs to skip — and it is absent when there is no
+/// wired default route to warn about, because a warning that is always printed is
+/// one nobody reads.
+@Test func theJoinInstructionsWarnAboutEthernetOnlyWhenAWiredDefaultRouteExists() throws {
+    let warned = ManualHotspotJoiner.instructions(ssid: "PKT01_EXAMPLE",
+                                                  passphrase: "ExampleK",
+                                                  wiredDefaultRoute: true)
+    #expect(warned.contains("UNPLUG ETHERNET FIRST"))
+    #expect(warned.contains("offers no internet"))
+    #expect(warned.contains("silently DROP the"))
+    #expect(warned.contains("keeping the address, the route and the ARP entry"))
+    // Above the Wi-Fi steps: the point is that it is acted on before the join,
+    // not read afterwards in a failure report.
+    let unplug = try #require(warned.range(of: "UNPLUG ETHERNET FIRST"))
+    let joinStep = try #require(warned.range(of: "Open System Settings > Wi-Fi"))
+    #expect(unplug.lowerBound < joinStep.lowerBound)
+
+    let quiet = ManualHotspotJoiner.instructions(ssid: "PKT01_EXAMPLE",
+                                                 passphrase: "ExampleK",
+                                                 wiredDefaultRoute: false)
+    #expect(!quiet.contains("UNPLUG ETHERNET"))
+    #expect(!quiet.contains("Ethernet"))
+    // Everything else the operator needs is unchanged either way.
+    for text in [warned, quiet] {
+        #expect(text.contains("Join the network named:  PKT01_EXAMPLE"))
+        #expect(text.contains("waiting for return…"))
+    }
+}
+
+/// And the joiner asks before it prints, so the warning is part of the
+/// instructions rather than a line racing them from somewhere else. The real
+/// answer comes from `NWPathMonitor` and therefore from whatever network the test
+/// machine is on, so the probe is a seam.
+@Test func theJoinerConsultsTheWiredDefaultRouteBeforePrompting() async throws {
+    let asked = Counter()
+    let joiner = ManualHotspotJoiner(wiredDefaultRoute: { _ = asked.next(); return false })
+    // `readLine()` on a closed/empty stdin returns nil immediately under the test
+    // runner, so this does not block.
+    try await joiner.join(ssid: "PKT01_EXAMPLE", passphrase: "ExampleK")
+    #expect(asked.next() == 2)   // 1 for the join, and this call is the 2nd
+}
+
+/// The defect the 2026-07-30 hardware session exposed, in the smallest form that
+/// reproduces it: an interface holding an address on the device's subnet while the
+/// link under it is NOT running.
+///
+/// That is what macOS leaves behind after a Wi-Fi interface disassociates — it
+/// keeps the address, the netmask, the route and the ARP entry — so *every* run
+/// that ever joined the recorder leaves a configuration that satisfies the
+/// pre-flight, and it is most likely to be stale exactly when somebody is testing
+/// repeatedly. The pre-flight still pins the interface (there is no other
+/// candidate, and pinning is what makes the framework answer promptly), but the
+/// diagnosis must say the address is a leftover instead of declaring the
+/// association settled.
+@Test func anAddressOnALinkThatIsNotRunningIsReportedAsALeftoverNotAnAssociation()
+    async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    scriptWIFIStateMachine(on: t, apUpPolls: 0)   // the device even reports a client (2)
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+    await session.setHostInterfaces(hostHoldingLinks(("lo0", "127.0.0.1", false)))
+
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: deadEndpoint,
+                                               joiner: RecordingJoiner(shouldFail: false),
+                                               readiness: briefReadiness)
+        Issue.record("expected the TCP connect to fail")
+    } catch PocketError.transferFailed(let thrown) {
+        detail = thrown
+    }
+
+    // The address is named, and immediately disowned as evidence.
+    #expect(detail.contains("lo0 holds 127.0.0.1 on the device's subnet, but that address is NOT "
+                            + "evidence that this host is on PKT01_EXAMPLE"))
+    #expect(detail.contains("lo0 is UP but not RUNNING"))
+    #expect(detail.contains("macOS keeps the address, the netmask, the route and the ARP entry"))
+    #expect(detail.contains("Rejoin PKT01_EXAMPLE and run this again"))
+    // The repair that cost a whole hardware session to find.
+    #expect(detail.contains("If a network cable is plugged into this Mac, unplug it"))
+    // And never the sentence this replaces.
+    #expect(!detail.contains("settled and out of the picture"))
+    #expect(!detail.contains("would not still be leasing"))
+    await session.stop()
+}
+
+/// The other way an address is contradicted, and the one that was accurate
+/// throughout the failing hardware run while this package's own prose was not:
+/// Network.framework reporting `ENETDOWN` for a connection it was **required** to
+/// carry on the interface holding that address.
+///
+/// Read only when the constraint was actually applied. Unpinned, `ENETDOWN` could
+/// be about some other interface; pinned to an interface that holds an address on
+/// the destination's own `/24`, "the destination is unreachable from here" is
+/// excluded by construction, so what is left is the interface not being on a
+/// network. Driven through `WiFiConnectDiagnosis` directly — the state sequence a
+/// failing run produces, with no radio.
+@Test func networkFrameworksOwnDownNetworkReasonOutranksThisPackagesInference() throws {
+    let running = HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2")
+    let down = String(describing: NWError.posix(.ENETDOWN))
+
+    // Pinned to that interface, ENETDOWN says the interface is not on a network.
+    let verdict = try #require(WiFiConnectDiagnosis.contradictionOfAddress(
+        running, waitingReason: down, interfaceWasRequired: true))
+    #expect(verdict.contains("Network.framework reported the network down"))
+    #expect(verdict.contains("required to carry on en0"))
+    #expect(verdict.contains("it means the interface is not on a network"))
+
+    // Unpinned it says nothing about THIS interface, so it is not read: an
+    // unconstrained connection's ENETDOWN can be about any path the framework
+    // considered.
+    #expect(WiFiConnectDiagnosis.contradictionOfAddress(
+        running, waitingReason: down, interfaceWasRequired: false) == nil)
+
+    // The neighbours it must not swallow: a host that answered, and a route with
+    // nothing on the other end. Both leave the address uncontradicted.
+    for reason in [NWError.posix(.ECONNREFUSED), NWError.posix(.EHOSTUNREACH)] {
+        #expect(WiFiConnectDiagnosis.contradictionOfAddress(
+            running, waitingReason: String(describing: reason),
+            interfaceWasRequired: true) == nil)
+    }
+    // And silence is not evidence either — the framework giving no reason at all
+    // is a finding, never a licence to declare the host unassociated.
+    #expect(WiFiConnectDiagnosis.contradictionOfAddress(
+        running, waitingReason: nil, interfaceWasRequired: true) == nil)
+
+    // The link flag needs no framework reason at all, and outranks a benign one.
+    let stalled = HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2",
+                                       linkIsRunning: false)
+    #expect(WiFiConnectDiagnosis.contradictionOfAddress(
+        stalled, waitingReason: nil, interfaceWasRequired: false)?
+        .contains("UP but not RUNNING") == true)
 }
 
 /// The verbose channel. `.waiting` repeats as conditions change, so the thrown
@@ -788,7 +994,7 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
 
     let pin = WiFiPathPin.interface(
         HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2"),
-        deviceSubnet: "192.168.200")
+        deviceSubnet: "192.168.200", alsoOnSubnet: [])
     let failure = watcher.failure("wifi tcp connect timed out after 30.0 seconds",
                                   pin: pin, pinnedInterface: "en0")
     // The message: the symptom, the interface required, the latest reason — and
@@ -837,7 +1043,7 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
 
     #expect(WiFiPathPin.choose(reaching: WiFiEndpoint.default,
                                among: [tunnel, wired, recorderInterface])
-            == .interface(recorderInterface, deviceSubnet: "192.168.200"))
+            == .interface(recorderInterface, deviceSubnet: "192.168.200", alsoOnSubnet: []))
     // Nothing on the device's subnet: this host is not on the access point, and
     // the connect must not be attempted at all.
     #expect(WiFiPathPin.choose(reaching: WiFiEndpoint.default, among: [tunnel, wired])
@@ -848,6 +1054,34 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     // reasoning from the device's report alone, exactly as before this existed.
     #expect(WiFiPathPin.choose(reaching: .hostPort(host: "recorder.local", port: 8475),
                                among: [recorderInterface]) == .noSubnetToCompare)
+}
+
+/// A tie is real ambiguity, not a free choice: an RFC1918 `/24` is not globally
+/// unique, so two interfaces sharing one can be on two different physical
+/// networks with only one of them reaching the device — this development host has
+/// `en0` and `en7` both on `192.168.1.x` right now. First match wins because it is
+/// deterministic, and the losers are carried and named so a transfer that fails
+/// because the wrong one was chosen says which others there were.
+@Test func aTieOnTheDeviceSubnetIsCarriedAndNamedRatherThanQuietlyResolved() {
+    let first = HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2")
+    let second = HostInterfaceAddress(interfaceName: "en7", address: "192.168.200.9")
+    let pin = WiFiPathPin.choose(reaching: WiFiEndpoint.default, among: [first, second])
+    #expect(pin == .interface(first, deviceSubnet: "192.168.200", alsoOnSubnet: [second]))
+    #expect(pin.interfaceName == "en0")   // deterministic: enumeration order
+
+    // Named before the attempt …
+    #expect(pin.summary.contains("AMBIGUOUS"))
+    #expect(pin.summary.contains("en7 192.168.200.9"))
+    // … and in the failure, where a reader deciding what to suspect will see it.
+    let failure = WiFiConnectWatcher().failure("wifi tcp connect timed out after 30.0 seconds",
+                                               pin: pin, pinnedInterface: "en0")
+    #expect(failure.detail.contains("it was not the only candidate"))
+    #expect(failure.detail.contains("en7 192.168.200.9"))
+    // The ordinary case says none of this.
+    let unambiguous = WiFiPathPin.choose(reaching: WiFiEndpoint.default, among: [first])
+    #expect(!unambiguous.summary.contains("AMBIGUOUS"))
+    #expect(!WiFiConnectWatcher().failure("x", pin: unambiguous, pinnedInterface: "en0")
+        .detail.contains("not the only candidate"))
 }
 
 /// The subnet is derived from `deviceHost`, not written down a second time: a
@@ -864,43 +1098,37 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     #expect(WiFiEndpoint.ipv4Host(of: .unix(path: "/tmp/x")) == nil)
 }
 
-/// What the pin builds for Network.framework. `requiredInterface` is the pin —
-/// measured as strictly enforced on this SDK, unlike `requiredLocalEndpoint`,
-/// which was ignored outright — and the prohibited types are belt and braces
-/// derived from the chosen interface's own name so they can never prohibit the
-/// very interface they accompany.
-@Test func thePinnedParametersRequireTheInterfaceAndProhibitWhatItCannotBe() {
+/// What the pin builds for Network.framework, and — as importantly — what it does
+/// **not** build. `requiredInterface` is the whole pin: measured as strictly
+/// enforced on this SDK, unlike `requiredLocalEndpoint`, which was ignored
+/// outright. Nothing else is set, so a connection that could not be pinned is a
+/// plain `NWParameters.tcp` and nothing more.
+@Test func thePinnedParametersRequireTheInterfaceAndConstrainNothingElse() {
     let physical = WiFiPathPin.interface(
         HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2"),
-        deviceSubnet: "192.168.200")
+        deviceSubnet: "192.168.200", alsoOnSubnet: [])
     #expect(physical.interfaceName == "en0")
-    // `en*` is Wi-Fi or wired Ethernet on both platforms, so a tunnel — `.other`,
-    // which is what a mesh VPN's utun reports as — can be excluded outright.
-    #expect(physical.prohibitedInterfaceTypes == [.cellular, .other])
-    // A tunnel-named interface might itself be `.other`, so that class stays
-    // allowed: this must never prohibit what it requires.
-    let tunnelHeld = HostInterfaceAddress(interfaceName: "utun9", address: "192.168.200.9")
-    #expect(WiFiPathPin.interface(tunnelHeld, deviceSubnet: "192.168.200")
-        .prohibitedInterfaceTypes == [.cellular])
-    // No evidence, no constraints: that path must behave exactly as before.
-    #expect(WiFiPathPin.noSubnetToCompare.prohibitedInterfaceTypes.isEmpty)
     #expect(WiFiPathPin.noSubnetToCompare.interfaceName == nil)
-    let unconstrained = WiFiPathPin.noSubnetToCompare.tcpParameters(requiring: nil)
-    #expect(unconstrained.requiredInterface == nil)
-    #expect(unconstrained.prohibitedInterfaceTypes == nil)
-    // Chosen but unresolvable (Network.framework lists no such interface): still
-    // constrained by class, and the failure message says the pin was not applied
-    // rather than implying one that never was.
-    let unpinned = physical.tcpParameters(requiring: nil)
-    #expect(unpinned.requiredInterface == nil)
-    #expect(unpinned.prohibitedInterfaceTypes == [.cellular, .other])
+
+    // No pin: byte for byte the parameters that shipped before any of this
+    // existed. An earlier version prohibited interface *types* here, inferred
+    // from the chosen interface's name — an inference that bought nothing where
+    // the pin applied and could prohibit the needed interface where it did not,
+    // arriving as a silent `.waiting` that reads exactly like the defect being
+    // fixed. It is gone, and this is what holds it gone.
+    for pin in [WiFiPathPin.noSubnetToCompare, physical] {
+        let parameters = pin.tcpParameters(requiring: nil)
+        #expect(parameters.requiredInterface == nil)
+        #expect(parameters.prohibitedInterfaceTypes == nil)
+        #expect(parameters.prohibitedInterfaces == nil)
+        #expect(parameters.requiredLocalEndpoint == nil)
+    }
 }
 
-/// The last mile of the pin, which no synthetic value can reach: `NWInterface`
-/// has no public initializer, so the only one that exists comes from a live
-/// `NWPath`. This asks the machine for one — any one — and requires it of the
-/// parameters, which is precisely the assignment production makes and the one
-/// place a synthetic interface list cannot stand in.
+/// The last mile of the parameter builder, which no synthetic value can reach:
+/// `NWInterface` has no public initializer, so the only one that exists comes
+/// from a live `NWPath`. What this cannot show is that `connect` *uses* what the
+/// builder returns — see `theConnectAppliesThePinToTheSocketItOpens`, which does.
 ///
 /// Passive: `NWPathMonitor` reads the system's own path state and sends nothing.
 /// A host that lists no interface at all cannot exercise a pin, and this says so
@@ -912,8 +1140,170 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
         "this host lists no available network interface, so the pin cannot be exercised")
     let pin = WiFiPathPin.interface(
         HostInterfaceAddress(interfaceName: interface.name, address: "192.168.200.2"),
-        deviceSubnet: "192.168.200")
+        deviceSubnet: "192.168.200", alsoOnSubnet: [])
     #expect(pin.tcpParameters(requiring: interface).requiredInterface == interface)
+}
+
+/// **The pin, proved on the socket `TCPFetch.connect` actually opens** — not on
+/// the parameters a builder hands back.
+///
+/// Every other integration test here reaches its endpoint over loopback, and
+/// Network.framework does not list the loopback interface, so the chosen
+/// interface resolves to nil and the parameters are indistinguishable from a
+/// plain `.tcp`. That made the headline fix invisible: reverting the connect to
+/// `NWConnection(to: endpoint, using: .tcp)`, or collapsing the interface lookup
+/// to nil, passed the entire suite. A test that survives its own mutation is the
+/// defect.
+///
+/// So this observes the pin's *effect* instead. Requiring an interface that
+/// cannot carry loopback traffic must make a connect to a live loopback listener
+/// fail, while the identical connect with nothing required succeeds — a causal
+/// pair, because only a connection that really was constrained can fail against a
+/// listener that is demonstrably up. Measured behaviour, not a guess: requiring
+/// `en0` of a loopback destination sits in
+/// `.waiting(POSIXErrorCode 50: Network is down)`.
+@Test func theConnectAppliesThePinToTheSocketItOpens() async throws {
+    let server = try LoopbackServer(payload: Data([0xFF, 0xF3]))
+    defer { server.stop() }
+
+    // Any interface Network.framework lists. None of them is loopback — that is
+    // the whole reason the loopback tests go unpinned — so none of them can carry
+    // a connection to 127.0.0.1.
+    let listed = await HostInterfaces.availableInterfaces(within: .milliseconds(500))
+    let carrier = try #require(
+        listed.first { $0.type != .loopback },
+        "this host lists no non-loopback interface, so an applied pin cannot be distinguished")
+
+    // Claim that interface holds the endpoint's own address, so `choose` picks it
+    // and `connect` is obliged to require it.
+    let pin = WiFiPathPin.choose(
+        reaching: server.endpoint,
+        among: [HostInterfaceAddress(interfaceName: carrier.name, address: "127.0.0.1")])
+    #expect(pin.interfaceName == carrier.name)
+
+    // Required interface cannot reach loopback ⇒ no socket, and the failure
+    // records which interface was required of it.
+    var failure: WiFiConnectFailure?
+    do {
+        let unexpected = try await TCPFetch.connect(to: server.endpoint,
+                                                    timeout: .milliseconds(600), pin: pin)
+        unexpected.cancel()
+        Issue.record("the connect ignored the required interface and connected anyway")
+    } catch let thrown as WiFiConnectFailure {
+        failure = thrown
+    }
+    #expect(try #require(failure).pinnedInterface == carrier.name)
+
+    // The control, and what makes the pair causal: the same endpoint, the same
+    // listener, nothing required — connects at once.
+    let connected = try await TCPFetch.connect(to: server.endpoint, timeout: .seconds(5),
+                                               pin: .noSubnetToCompare)
+    connected.cancel()
+}
+
+// MARK: - The pre-flight's wait for an address that has not arrived yet
+//
+// This window is the only thing standing between an iOS join whose DHCP has not
+// completed and a hard refusal, and iOS is the path that works today. A
+// regression there would be worse than the bug being fixed, so it gets tests that
+// go red if it is removed.
+
+/// Readiness that resolves inside a test run and makes the two budgets — the
+/// short one for a host that is simply elsewhere, the full one for a join still
+/// being refused a lease — far enough apart to tell apart.
+private let preFlightReadiness = WiFiReadiness(timeout: .milliseconds(500),
+                                               pollInterval: .milliseconds(5),
+                                               pingInterval: .seconds(60),
+                                               hostAddressWait: .milliseconds(50))
+
+/// The grace window itself: an address that shows up a few looks late — DHCP
+/// completing after `NEHotspotConfiguration.apply` has already returned — is
+/// waited for, not refused.
+@Test func thePreFlightWaitsForAnAddressThatArrivesLate() async {
+    let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
+    let leased = HostInterfaceAddress(interfaceName: "en0", address: "127.0.0.1")
+    let looks = Counter()
+    await session.setHostInterfaces { looks.next() < 3 ? [] : [leased] }
+
+    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness)
+
+    #expect(pin == .interface(leased, deviceSubnet: "127.0.0", alsoOnSubnet: []))
+    await session.stop()
+}
+
+/// And the other side of it: a host that is simply not on the network is answered
+/// in `hostAddressWait`, not made to sit out the whole connect budget. The 30 s
+/// timeout this replaced is the behaviour being removed.
+@Test func thePreFlightGivesUpQuicklyOnAHostThatIsSimplyElsewhere() async {
+    let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
+    await session.setHostInterfaces(hostHolding(("en1", "10.0.1.23")))
+
+    let clock = ContinuousClock()
+    let began = clock.now
+    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness)
+    let elapsed = clock.now - began
+
+    #expect(pin == .hostNotOnTheDeviceSubnet(
+        deviceSubnet: "127.0.0",
+        held: [HostInterfaceAddress(interfaceName: "en1", address: "10.0.1.23")]))
+    // Comfortably inside the 500 ms connect budget: the short answer was taken.
+    #expect(elapsed < .milliseconds(250))
+    await session.stop()
+}
+
+/// The budget is evidence-driven rather than a timing guess. A self-assigned
+/// 169.254 address means this host associated with an access point and is still
+/// being refused a lease — a join trying, not a host elsewhere — so it earns the
+/// full connect budget instead of the short one. It can never exceed that budget,
+/// so this still never waits longer than the connect it replaced.
+@Test func thePreFlightKeepsWaitingWhileDHCPIsStillBeingRefused() async {
+    let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
+    await session.setHostInterfaces(hostHolding(("en0", "169.254.12.34")))
+
+    let clock = ContinuousClock()
+    let began = clock.now
+    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness)
+    let elapsed = clock.now - began
+
+    #expect(pin == .hostNotOnTheDeviceSubnet(
+        deviceSubnet: "127.0.0",
+        held: [HostInterfaceAddress(interfaceName: "en0", address: "169.254.12.34")]))
+    // Well past the 50 ms short budget — it held on for the full 500 ms one.
+    #expect(elapsed > .milliseconds(250))
+    #expect(elapsed < .seconds(2))
+    await session.stop()
+}
+
+/// A host in that state is joined — the password was accepted — and unleased. The
+/// repair is renewing the lease, and telling somebody to forget the network would
+/// send them to re-enter a credential that was never the problem.
+@Test func aHostWithOnlyASelfAssignedAddressIsToldToRenewItsLease() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    scriptWIFIStateMachine(on: t, apUpPolls: 0)
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+    await session.setHostInterfaces(hostHolding(("en0", "169.254.12.34")))
+
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: deadEndpoint,
+                                               joiner: RecordingJoiner(shouldFail: false),
+                                               readiness: briefReadiness)
+        Issue.record("expected the pre-flight to refuse")
+    } catch PocketError.transferFailed(let thrown) {
+        detail = thrown
+    }
+
+    #expect(detail.contains("wifi tcp connect not attempted"))
+    #expect(detail.contains("self-assigned 169.254.x.x address on en0"))
+    #expect(detail.contains("it DID associate with an access point"))
+    #expect(detail.contains("Renew DHCP Lease"))
+    // Emphatically not the credential repair: the password was accepted.
+    #expect(!detail.contains("Forget"))
+    #expect(!detail.contains("Join PKT01_EXAMPLE and run this again"))
+    await session.stop()
 }
 
 /// Network.framework's own interface list is the only source of `NWInterface`
@@ -1028,11 +1418,16 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     let deviceSide = WiFiJoinDiagnosis.allCases.map { WiFiConnectDiagnosis.nothingEverJoined($0) }
     let pathSide: [WiFiConnectDiagnosis] = [
         .pathUnusableFromThisHost(interface: "en0", address: "192.168.200.2",
+                                  interfaceWasRequired: true,
                                   waitingReason: "POSIXErrorCode(rawValue: 50): Network is down"),
-        .pathUnusableFromThisHost(interface: "en0", address: "192.168.200.2", waitingReason: nil),
+        .pathUnusableFromThisHost(interface: "en0", address: "192.168.200.2",
+                                  interfaceWasRequired: true, waitingReason: nil),
+        .pathUnusableFromThisHost(interface: "en0", address: "192.168.200.2",
+                                  interfaceWasRequired: false, waitingReason: nil),
     ]
     let all = hostSide + deviceSide + pathSide + [.accessPointClosedItself,
-                                                  .associatedThenUnreachable]
+                                                  .associatedThenUnreachable,
+                                                  .joinedButNeverLeased(interface: "en0")]
     let texts = all.map { $0.guidance(ssid: "PKT01_EXAMPLE") }
     #expect(Set(texts).count == texts.count)
 
@@ -1063,6 +1458,25 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     #expect(quoted.contains("Network.framework's last reason for not proceeding was: "
                             + "POSIXErrorCode(rawValue: 50): Network is down"))
     #expect(!quoted.contains("Forget"))
+    // Where the constraint WAS applied, blaming a VPN for owning the default
+    // route would be a confident wrong cause: the constraint excludes it.
+    #expect(quoted.contains("The connection WAS required to use en0"))
+    #expect(quoted.contains("nothing else can have captured this path"))
+    #expect(!quoted.contains("VPN or mesh client owning the default route is the first thing"))
+    // Where it was NOT applied, that is exactly what to check first — and the
+    // two must not say the same thing, which is the whole point of carrying it.
+    let unpinned = pathSide[2].guidance(ssid: "PKT01_EXAMPLE")
+    #expect(unpinned.contains("could NOT be required to use en0"))
+    #expect(unpinned.contains("VPN or mesh client owning the default route is the first thing"))
+    #expect(!unpinned.contains("nothing else can have captured this path"))
+    // A join that associated and was never leased is its own story, with its own
+    // repair, and must not reach for the credential one.
+    let unleased = WiFiConnectDiagnosis.joinedButNeverLeased(interface: "en0")
+        .guidance(ssid: "PKT01_EXAMPLE")
+    #expect(unleased.contains("it DID associate with an access point"))
+    #expect(unleased.contains("Renew DHCP Lease"))
+    #expect(unleased.contains("Do NOT forget PKT01_EXAMPLE"))
+    #expect(!unleased.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
     let silent = pathSide[1].guidance(ssid: "PKT01_EXAMPLE")
     #expect(silent.contains("Network.framework never gave a reason at all"))
     #expect(silent.contains("as distinct from a refused connect (immediate)"))

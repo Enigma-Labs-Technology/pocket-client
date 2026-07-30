@@ -249,7 +249,8 @@ the index.
 | Rotating the key breaks saved Wi-Fi | The AP password is the session key's first 8 characters and follows the live binding, but the SSID is the BLE name and does not change. Every host that joined before the rotation keeps offering the old password and fails, and **no app can clear a user-saved network** — it must be forgotten by hand. | [When the join fails](#when-the-join-fails) |
 | Ten bytes past the end | A Wi-Fi transfer's TCP stream carries a short trailer (10 bytes observed) past the announced length. The announced count is authoritative; drain-to-EOF overshoots and fails an exact-length check. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
 | The AP does not wait for the person joining it | The device brings its access point up on `APP&WIFIO` and takes it down again on its own. A manual join — System Settings, a stale network, a password — can outlast it, after which the host still holds a `192.168.200.x` lease and everything it sends gets `No route to host`. The keepalive spans the join for exactly this reason. | [The access point does not wait for you](#the-access-point-does-not-wait-for-you) |
-| One Wi-Fi session per recording means one join prompt per recording | `joinOnce = true` makes iOS discard the configuration on disassociation, so a ten-file sync asks the person to join ten times and pays the ~6.5 s association ten times. Batching them into one session avoids that — **if** the device serves a second selection, which nobody has ever tried. | [One access-point session for a whole sync](#one-access-point-session-for-a-whole-sync) |
+| One Wi-Fi session per recording means one join prompt per recording | `joinOnce = true` makes iOS discard the configuration on disassociation, so a ten-file sync asks the person to join ten times and pays the ~6.5 s association ten times. Batching them into one session avoids that. The device **does** serve a second selection on a live AP (2026-07-30) — the transfer over it then reset, so the batch falls back per recording and never loses one. | [One access-point session for a whole sync](#one-access-point-session-for-a-whole-sync) |
+| A Mac's Wi-Fi address outlives its association | macOS keeps the address, netmask, route and ARP entry after disassociating, so `ifconfig` shows `192.168.200.2` on a host that is on no network at all. Nothing may read an address as proof of a join — and with Ethernet holding the default route, macOS drops the association to this no-internet AP and leaves exactly that behind. | [Unplug Ethernet before a Wi-Fi transfer on macOS](#unplug-ethernet-before-a-wi-fi-transfer-on-macos) |
 | `APP&SHUT` may never answer | On an idle device there is **no** `MCU&SHUT`. Blocking on the reply hangs the happy path. | [12 · Go below the session](#12--go-below-the-session) |
 | `APP&U&WIFI` is a modifier | It reroutes the upload already selected by `APP&U&<date>&<ts>` to the TCP socket. Sent alone it has nothing to reroute. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
 | `WiFiState` counts *down* | The progression is `0` off → `3` AP up → `2` client associated → `1` TCP connected. The numbers are not a sequence. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
@@ -778,9 +779,10 @@ any upload command, so it does not mean "transferring".
 
 ### One access-point session for a whole sync
 
-**Evidence:** `unverified`. The batch mechanics are unit-tested against a fake
-device on both branches of the unknown below, and neither branch has run against
-hardware.
+**Evidence:** `hardware` for the device serving a second selection (2026-07-30);
+`unverified` for reuse actually completing a transfer. The batch mechanics —
+including the fallback from a reuse that breaks mid-stream — are unit-tested
+against a fake device on every branch below.
 
 A session is expensive. The handshake plus the association wait costs about
 **6.5 s for the association alone**, and on iOS `joinOnce = true` makes the OS
@@ -795,27 +797,38 @@ let result = try await device.downloadOverWiFi(
 
 result.delivered          // one outcome per recording that arrived, in order
 result.stopped            // nil ⇔ all of them; otherwise which one stopped the run
-result.didReuseSession    // did the device serve a second selection on a live AP?
-result.refusals           // …or did it refuse, and what did it say?
+result.didReuseSession    // was a recording DELIVERED over a reused session?
+result.refusals           // …or did the device refuse, and what did it say?
+result.reuseInterruptions // …or did it serve one and the transfer then break?
+result.reuseVerdict       // the four-term answer, typed rather than prose
 result.sessionsOpened     // 1 is the win; delivered.count is the fallback
 ```
 
+> [!IMPORTANT]
+> **A batch never delivers fewer recordings than the same list transferred one at
+> a time would.** That is the guarantee, and it holds however the device behaves.
+> Reuse is attempted; if the device declines it, or serves it and the transfer
+> then breaks, the session is torn down properly (`APP&SHUT` + `APP&WIFIC`, then
+> leave the network), **any partial bytes are discarded**, a session is opened for
+> that recording, and it is fetched again from byte zero. That retry is exactly
+> one, and reuse is not attempted again in that run. **The worst case is exactly
+> one session per recording** — today's behaviour — never a wedged device, a
+> half-open access point, or a truncated file.
+
 > [!WARNING]
-> **The reuse is `unverified`, and that is the whole point of the API shape.**
-> Nobody has ever issued a second `APP&U&<date>&<ts>` while the access point was
-> still up — the capture this protocol was decoded from covered a single-file
-> sync — so the device may serve it, refuse it, or do something else. The run
-> **attempts** reuse and falls back cleanly: the moment the device will not serve
-> a recording on the live session, the session is torn down properly (`APP&SHUT` +
-> `APP&WIFIC`, then leave the network) and a fresh one is opened for that
-> recording, and reuse is not attempted again in that run. **The worst case is
-> exactly one session per recording** — today's behaviour — never a wedged device
-> or a half-open access point. Every refusal is decided *before* a payload byte of
-> that recording has flowed, which is what makes the restart safe.
+> **What hardware has settled, and what it has not.** On 2026-07-30 the device
+> *did* serve a second `APP&U&<date>&<ts>` on a live access point: a second TCP
+> connection with no re-join, and the next file's length announced. So it does not
+> refuse reuse. The stream then reset mid-transfer, so reuse does not yet *work*
+> either. Whether that reset is avoidable at all — this client's socket handling,
+> or device behaviour to fall back from — is one observation old and settles
+> nothing.
 >
-> Settle it on your own device with
-> [`pocket-cli sync-wifi`](#sync-wifi--the-reuse-experiment) and please record the
-> answer; either one is a result.
+> The same run also showed why this needs saying: the batch stopped with one of
+> two recordings delivered, because only a refusal seen *before* the payload phase
+> triggered the fallback. That is fixed, and the guarantee above is what replaced
+> it. Run [`pocket-cli sync-wifi`](#sync-wifi--the-reuse-experiment) against your
+> own device and please record the transcript; the `session:` lines are the result.
 
 Five things to know:
 
@@ -861,7 +874,7 @@ public protocol HotspotJoining: Sendable {
 | Implementation | Platform | Behaviour | Evidence |
 |---|---|---|---|
 | `SystemHotspotJoiner` (default) | iOS | Joins programmatically via `NEHotspotConfiguration` with `joinOnce = true`. Requires the Hotspot Configuration entitlement **in the consuming app**, not in this package. Treats `alreadyAssociated` as success, so a half-failed earlier attempt does not silently degrade `.auto` to BLE. On macOS it throws `PocketError.wifiJoinFailed` naming the SSID and password. | `compile-only` on iOS |
-| `ManualHotspotJoiner` | macOS | Prints the SSID and password, blocks on `readLine()` until the operator joins in System Settings and presses return, then runs the transfer. The read runs on a thread of its own, off Swift concurrency's cooperative pool, so the `APP&WPING` keepalive that spans the join keeps running while a person takes their time — see [The access point does not wait for you](#the-access-point-does-not-wait-for-you). Afterwards it says the operator may rejoin their normal network. It also warns that a Mac which joined this AP before a key rotation will silently reuse the old password — printing the right one is [demonstrably not enough](#when-the-join-fails). | `hardware` |
+| `ManualHotspotJoiner` | macOS | Prints the SSID and password, blocks on `readLine()` until the operator joins in System Settings and presses return, then runs the transfer. The read runs on a thread of its own, off Swift concurrency's cooperative pool, so the `APP&WPING` keepalive that spans the join keeps running while a person takes their time — see [The access point does not wait for you](#the-access-point-does-not-wait-for-you). Afterwards it says the operator may rejoin their normal network. It also warns that a Mac which joined this AP before a key rotation will silently reuse the old password — printing the right one is [demonstrably not enough](#when-the-join-fails) — and, when a wired link is carrying the default route, leads with [unplug Ethernet first](#unplug-ethernet-before-a-wi-fi-transfer-on-macos). | `hardware` |
 
 ```swift
 // macOS harness
@@ -954,9 +967,22 @@ confidently names the wrong cause is worse than a bare error:
 
 | What the evidence shows | What a failed TCP connect says |
 |---|---|
+| No interface holds an address on the device's `/24`, but one holds a self-assigned `169.254` address | This host **did** associate — so the password was accepted — and DHCP never answered. Names renewing the lease, and says explicitly *not* to forget the network. |
 | No interface on this host holds an address on the device's `/24` | This **host** is not on the AP, whatever the device reported. Names the SSID to join, plus the stale-credential repair below. The connect is not attempted at all. |
 | An interface does, and the device reported its Wi-Fi **off** | The access point came down by itself before anything could connect. Explicitly not a credential this host holds — see [the access point's lifetime](#the-access-point-does-not-wait-for-you). |
-| An interface does, and the AP is still up | The association and the credentials are settled, and so is the AP's lifetime — a device that had closed its AP would not still be leasing the address. Names the interface and quotes the reason `Network.framework` gave, or states that it gave none. |
+| An interface does, and the link under it is **not running**, or `Network.framework` reported `ENETDOWN` for a connection required to use it | The address is a **leftover, not an association** — macOS keeps the address, netmask, route and ARP entry after disassociating. Says so, says to rejoin, and says to unplug Ethernet, which is what this configuration usually means. |
+| An interface does, its link is running, and nothing contradicts it | This host is **configured** to reach the device — stated as configuration, not as a live association. Names the interface and quotes the reason `Network.framework` gave, or states that it gave none. Where the interface really **was** required of the connection, the guidance says so and rules a VPN or a default route out rather than blaming one — the constraint already excludes them. |
+
+**An address is not an association, and this table used to say it was.** Until
+0.1.5 the last row declared the association, the credentials *and* the access
+point's lifetime all settled, on the reasoning that "a device that had closed its
+AP would not still be leasing this address". macOS keeps the address after
+disassociating and the address is not a lease the device is granting, so that was
+three confident claims resting on nothing — and it was most wrong exactly when
+somebody was testing repeatedly, because by the second attempt the leftover
+address is always there. Two facts can contradict an address and both are read:
+`IFF_RUNNING` from `getifaddrs`, and `ENETDOWN` on a pinned connection. Neither
+can prove the opposite, and nothing here claims it does.
 
 The interface evidence is preferred to `MCU&WIFIS` on purpose: the device reports
 `2` for **any** associated client, and hardware confirmed that a Mac auto-joining
@@ -964,6 +990,33 @@ a remembered network satisfies that check while proving nothing about this
 process. Where the endpoint is overridden with something that is not an IPv4
 `host:port` there is no interface evidence, and the diagnosis falls back to
 reasoning from the device's report alone.
+
+### Unplug Ethernet before a Wi-Fi transfer on macOS
+
+**Evidence:** `hardware` (2026-07-30 — the failure and the fix in one session);
+`unit` for the warning.
+
+The recorder's access point offers no internet. With a **wired link carrying this
+Mac's default route**, macOS associates with it and then silently drops the
+association — while leaving the address, the netmask, the route and the ARP entry
+in place. Every host-side probe then reports a healthy connection to a network
+that is not there, and the transfer fails with symptoms that point everywhere but
+at the cable. It cost several hardware rounds; unplugging Ethernet produced the
+first successful macOS Wi-Fi transfer on the next attempt.
+
+So `ManualHotspotJoiner` checks whether the default path runs over wired Ethernet
+and, when it does, leads the join instructions with it:
+
+```
+ACTION REQUIRED — the recorder's WiFi access point is now up.
+
+  0. UNPLUG ETHERNET FIRST. A wired link is carrying this Mac's default
+     route, and PKT01_EXAMPLE offers no internet. …
+  1. Open System Settings > Wi-Fi on THIS Mac.
+```
+
+Before the join, not after the failure — that is the only point in the run where
+it can still be acted on. Plug the cable back in when the sync is done.
 
 **The repair is manual, and that is not an oversight.**
 `NEHotspotConfigurationManager.removeConfiguration(forSSID:)` removes only
@@ -1080,7 +1133,7 @@ the app joins with `NEHotspotConfiguration`, so the path belongs to the process.
 The device's address is a fixed constant on a directly-connected `/24`, so this
 host's own address on that subnet identifies the right interface unambiguously.
 `getifaddrs` finds it, and the connection then **requires** that interface
-(`NWParameters.requiredInterface`) and prohibits the classes it provably is not.
+(`NWParameters.requiredInterface`), and sets nothing else.
 `requiredInterface` is the pin rather than `requiredLocalEndpoint` because that is
 what measurement showed to be enforced: a connection required to use `en0` while
 its destination is reachable only over loopback sits in
@@ -1088,12 +1141,27 @@ its destination is reachable only over loopback sits in
 was ignored outright — including when the address it named belonged to no
 interface on the machine.
 
+Nothing else is set on the connection. An earlier revision also prohibited
+interface *types*, inferred from the chosen interface's name — that inference is
+gone: it bought nothing where the pin applied (`requiredInterface` already
+excludes every other interface), and where the pin did *not* apply it could
+prohibit the interface the connection needed, arriving as a silent `.waiting`
+indistinguishable from the defect being fixed and met by guidance blaming a VPN.
+Producing exactly that misattribution is not a price worth paying for a
+redundancy.
+
 Where no interface holds an address on that subnet, the host is not on the access
 point and the connect is not attempted: it says so at once and names the SSID to
-join, instead of spending 30 s finding out. The pre-flight allows a short bounded
-wait first, because on iOS `NEHotspotConfiguration.apply` returns on association —
-which can be before DHCP has handed the phone its address — and that path works
-today.
+join, instead of spending 30 s finding out. Two things keep that from being a
+timing guess. The pre-flight waits `WiFiReadiness.hostAddressWait` (3 s) first,
+because on iOS `NEHotspotConfiguration.apply` returns on association — which can
+be before DHCP has handed the phone its address — and that path works today. And
+for as long as some interface holds a self-assigned `169.254` address, the wait
+extends to the full `timeout`, because that address means this host associated
+with an access point and is still being refused a lease: a join trying, not a host
+somewhere else. The ceiling is `timeout` either way, so the pre-flight can never
+wait longer than the connect it replaced, and it ends in a diagnosis rather than a
+bare timeout however long it takes.
 
 ### Empty recordings
 
@@ -1712,19 +1780,31 @@ and its per-recording `session:` lines *are* the result — capture the transcri
 POCKET_SK=ExampleKey000000 swift run pocket-cli sync-wifi 2026-01-04 3
 ```
 
-Each recording reports one of four things, and only the second is news:
+Each recording reports one of these, including the recording the run stopped on —
+a stop carries a finding too, and on 2026-07-30 it carried the only interesting
+one in the whole run:
 
 | Line | Meaning |
 |---|---|
 | `OPENED` | The first recording: full handshake, join, association wait. |
-| `REUSED` | Served on the session an earlier recording opened. **This is the answer we do not have** — if it appears, the device does serve a second `APP&U&<date>&<ts>` on a live AP. |
-| `RESTARTED` | The device would not serve this recording on the live session, and the refusal is printed verbatim. The session was torn down and reopened; nothing was lost. |
+| `REUSED` | Served on the session an earlier recording opened, **and the transfer completed**. This is the answer we still do not have. |
+| `RESTARTED` (refusal) | The device would not serve this recording on the live session, and the refusal is printed verbatim. Torn down and reopened; nothing was lost. |
+| `RESTARTED` (interruption) | The device **served** this recording on the live session and the transfer then failed. The interruption and the number of partial bytes discarded are printed; the recording was fetched again from byte zero on a session of its own. This is what hardware did on 2026-07-30. |
 | `OWN` | Reuse was already ruled out this run, so this recording opened its own session — exactly what `download … wifi` does per file. |
 
-Then a verdict: `SESSION REUSE WORKS`, `SESSION REUSE IS REFUSED` (with what the
-device said), or `INCONCLUSIVE` when no recording ever got as far as asking. A
-refusal is just as useful an answer as a success — it settles the open item in
-[the protocol reference](docs/protocol/ble-protocol.md) either way.
+Then a verdict, in four terms — because serving a second selection and completing
+a transfer over one turned out to be separate facts:
+
+| Verdict | Meaning |
+|---|---|
+| `SESSION REUSE WORKS` | A recording was delivered over a reused session, and nothing broke. |
+| `SESSION REUSE WORKS BUT DID NOT HOLD` | Both happened in one run: a reliability finding rather than a capability one. |
+| `THE DEVICE SERVED A SECOND SELECTION ON A LIVE SESSION, AND THE TRANSFER THEN FAILED` | The 2026-07-30 result. It settles the old question in the positive — the device does not refuse reuse — and opens the question of the reset. |
+| `SESSION REUSE IS REFUSED` | The device declined, before any payload byte. Just as useful an answer as a success. |
+| `INCONCLUSIVE` | Nothing was ever asked. It says which kind: a run too short to exercise reuse, or one that stopped before it could. |
+
+Whichever it is, it settles the open item in
+[the protocol reference](docs/protocol/ble-protocol.md).
 
 Because the Mac join is manual, the run is also its own control: you should be
 asked to join the network **once** if reuse works and once per recording if it
@@ -1958,17 +2038,18 @@ about the host can confound the answer. What is *not* in question is that the
 keepalive keeps the BLE link up: an `MCU&WPING` arriving mid-attempt on hardware
 showed that much.
 
-**Whether the device will serve a second `APP&U&<date>&<ts>` while its access point
-is still up.** Nobody has tried. The capture the protocol was decoded from covered a
-single-file sync, and there is no firmware string or app behaviour to infer from
-either — this is not a weak claim, it is an absence of one. It matters because a
-session per recording means a join prompt per recording (ten of them, watched on
-2026-07-29). So `downloadOverWiFi(_ recordings:)` attempts reuse, detects a
-refusal before any payload byte of the affected recording has flowed, tears the
-session down properly, and continues one-session-per-recording — which is exactly
-the behaviour that *is* `hardware`. `pocket-cli sync-wifi` exists to answer it;
-until it has been run, believe nothing about the reuse and everything about the
-fallback.
+**Whether a transfer over a reused access-point session can complete.** The
+device serving a second `APP&U&<date>&<ts>` on a live AP is no longer in question:
+on 2026-07-30 it took a second TCP connection with no re-join and announced the
+next file's length. The stream then reset mid-transfer, and one observation cannot
+say whether that is device behaviour or this client's socket handling — so the
+capability is `hardware` and the *usefulness* of it is still `unverified`. It
+matters because a session per recording means a join prompt per recording (ten of
+them, watched on 2026-07-29). `downloadOverWiFi(_ recordings:)` attempts reuse and
+falls back to a session opened for that recording whenever it is refused **or**
+interrupted, discarding any partial bytes — which is exactly the behaviour that
+*is* `hardware`. So: believe the fallback, and believe about reuse only that the
+device will start one. `pocket-cli sync-wifi` prints which happened.
 
 **`inferred`** — four things, and each is treated as a reason for caution rather
 than a claim:
