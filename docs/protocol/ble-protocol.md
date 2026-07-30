@@ -403,6 +403,35 @@ there are gaps between files, so the client pings whenever the session has been
 silent for the ping interval — and only then, so nothing pings on top of a
 transfer that is already streaming bytes.
 
+### The access point has a lifetime, and a manual join can outlast it (hardware, 2026-07-28)
+
+The device brings its AP up on `APP&WIFIO` and does not hold it open
+indefinitely. Where the join is manual — macOS, where the client prints
+instructions and waits for the operator — the pause between `APP&WIFIO` and the
+TCP connect is however long a person takes in System Settings, and a minute is
+enough to lose the AP.
+
+Observed on a Mac still joined to the recorder's AP, moments after a failed
+transfer:
+
+| Probe | Result | Reading |
+|---|---|---|
+| `ifconfig en0` | `inet 192.168.200.2 netmask 0xffffff00` | association and DHCP both succeeded |
+| `route -n get 192.168.200.1` | `interface: en0`, no gateway | correct interface route, nothing hijacked |
+| `ping 192.168.200.1` | `No route to host` | ARP unanswered |
+| `nc -vz 192.168.200.1 8475` | `No route to host` | same, at the transfer port |
+
+`No route to host` on a directly-connected subnet with a valid interface route
+means the peer is not answering at layer 2 — the device had answered DHCP minutes
+earlier and was gone by the time the transfer ran. The only symptom reaching the
+process was `wifi tcp connect timed out after 30.0 seconds`.
+
+`APP&WPING` therefore starts **before** the join rather than after it, so the
+link (and the AP with it) survives a human-paced association. The exact AP
+lifetime is not measured; it is longer than a programmatic `NEHotspotConfiguration`
+join, which is why the phone path never showed this, and shorter than a minute of
+System Settings.
+
 **How to settle it:** `pocket-cli sync-wifi <date> [count]` transfers several
 recordings in one run and prints, per recording, whether the session was reused
 or had to be restarted. Either answer is a result; record it here.

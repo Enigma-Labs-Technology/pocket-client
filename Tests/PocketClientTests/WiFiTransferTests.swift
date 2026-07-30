@@ -651,9 +651,11 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
 }
 
 /// The counterpart, and the reason the check is conditioned: when the device
-/// DID report an associated client the host is demonstrably on the AP, so
-/// cached credentials are not the story and the message stays as it was.
-@Test func aConnectFailureAfterAnObservedAssociationIsNotBlamedOnSavedCredentials() async throws {
+/// DID report an associated client the host is demonstrably on the AP, so cached
+/// credentials are not the story — and the failure gets its OWN diagnosis instead
+/// of none. This is the 2026-07-28 shape: associated, leased, and then the access
+/// point was gone by the time the socket was asked for.
+@Test func aConnectFailureAfterAnObservedAssociationBlamesTheAccessPointsLifetime() async throws {
     let t = FakeTransport()
     scriptWiFiConversation(on: t)
     t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
@@ -671,8 +673,316 @@ private let briefReadiness = WiFiReadiness(timeout: .milliseconds(100),
         detail = thrown
     }
 
-    #expect(detail.contains("wifi tcp connect"))
+    #expect(detail.contains("wifi tcp connect"))   // the original symptom is kept
+    // The credential story is absent — the host was demonstrably on the AP …
     #expect(!detail.contains("never reported a client on its AP"))
     #expect(!detail.contains("Forget"))
+    // … and the access point's lifetime is named in its place, with the
+    // host-side signature that confirms it.
+    #expect(detail.contains("the device DID report a client on its access point (MCU&WIFIS&2)"))
+    #expect(detail.contains("nothing about the password is in question"))
+    #expect(detail.contains("The access point's lifetime is what to spend less of"))
+    #expect(detail.contains("`ping 192.168.200.1` answers `No route to host`"))
     await session.stop()
+}
+
+/// The third story the device can tell, and the one that made the earlier
+/// diagnosis dangerous: it reported its WiFi **off** while this client was still
+/// waiting for the association. The access point came down by itself, so no
+/// credential this host holds could have mattered — and blaming one would send
+/// the reader to forget a network for nothing.
+@Test func aConnectFailureAfterTheDeviceReportedItsWiFiOffBlamesTheAccessPoint() async throws {
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    t.script["APP&SK&\(matchingKey)"] = ["MCU&SK&OK"]
+    t.script["APP&WIFIS"] = ["MCU&WIFIS&0"]   // the AP came down under us
+    let session = PocketSession(transport: t, sessionKey: matchingKey)
+    try await session.start()
+
+    var detail = ""
+    do {
+        _ = try await session.downloadOverWiFi(recording, endpointOverride: deadEndpoint,
+                                               joiner: RecordingJoiner(shouldFail: false),
+                                               readiness: briefReadiness)
+        Issue.record("expected the TCP connect to fail")
+    } catch PocketError.transferFailed(let thrown) {
+        detail = thrown
+    }
+
+    #expect(detail.contains("wifi tcp connect"))
+    #expect(detail.contains("the device reported its WiFi off (MCU&WIFIS&0)"))
+    #expect(detail.contains("that is the device's doing, not a credential this host holds"))
+    #expect(detail.contains("The access point's lifetime is what to spend less of"))
+    // Emphatically NOT the credential guidance: the device's own report rules it
+    // out, and a confident wrong cause is worse than a bare error.
+    #expect(!detail.contains("Forget"))
+    #expect(!detail.contains("never reported a client on its AP"))
+    await session.stop()
+}
+
+/// The three stories must read differently — telling them apart is the point —
+/// and the two access-point-lifetime ones must never reach for the credential
+/// repair, which is the mistake this type exists to prevent.
+@Test func theConnectDiagnosisSeparatesAccessPointLifetimeFromCredentials() {
+    let lifetime: [WiFiConnectDiagnosis] = [.associatedThenUnreachable, .accessPointClosedItself]
+    let credentials = WiFiJoinDiagnosis.allCases.map { WiFiConnectDiagnosis.nothingEverJoined($0) }
+    let texts = (lifetime + credentials).map { $0.guidance(ssid: "PKT01_EXAMPLE") }
+    #expect(Set(texts).count == texts.count)
+
+    for text in lifetime.map({ $0.guidance(ssid: "PKT01_EXAMPLE") }) {
+        #expect(text.contains("The access point's lifetime is what to spend less of"))
+        #expect(text.contains("Join PKT01_EXAMPLE promptly, stay on it, and run this again"))
+        #expect(!text.contains("Forget"))
+        #expect(!text.contains("saved"))
+    }
+    for text in credentials.map({ $0.guidance(ssid: "PKT01_EXAMPLE") }) {
+        #expect(text.contains("nothing joined PKT01_EXAMPLE"))
+        #expect(text.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+        #expect(!text.contains("The access point's lifetime"))
+    }
+}
+
+// MARK: - The keepalive spans the join itself
+//
+// The defect this section exists for, in one line: on macOS `joiner.join` blocks
+// on a human for about a minute, the keepalive that stops the device's access
+// point idling out did not start until `join` returned, and so no Wi-Fi transfer
+// from a Mac had ever completed. `wifi tcp connect timed out after 30.0 seconds`
+// was the only symptom that reached the process; `No route to host` from ping and
+// from nc, against a valid 192.168.200.x lease, was the diagnosis on the wire.
+
+/// A joiner that **blocks its thread** for the whole join, exactly as
+/// `ManualHotspotJoiner`'s `readLine()` does, and through the same production
+/// hand-off — so a test using it exercises `runOffTheCooperativePool` rather than
+/// a stand-in for it.
+///
+/// Released by `unblock()`, and otherwise by a bounded give-up, so a regression
+/// FAILS this test instead of wedging the suite.
+final class ThreadBlockingJoiner: HotspotJoining, @unchecked Sendable {
+    /// Long enough that a ping interval a hundred times smaller cannot be missed
+    /// by scheduling luck, short enough that a failing run still finishes.
+    static let patience = DispatchTimeInterval.seconds(5)
+
+    private let gate = DispatchSemaphore(value: 0)
+    private let state = NSLock()
+    private var releasedByPing = false
+    private var observedThreadName: String?
+    private var leaveCount = 0
+
+    /// Lets the blocked join finish. Called from the transport's `onSend` when the
+    /// keepalive ping appears — i.e. from another thread entirely, which is the
+    /// arrangement under test.
+    func unblock() { gate.signal() }
+
+    /// True when the join ended because a ping arrived, not because it gave up.
+    var wasReleasedByAPing: Bool { state.lock(); defer { state.unlock() }; return releasedByPing }
+    /// The name of the thread the blocking work actually ran on.
+    var threadName: String? { state.lock(); defer { state.unlock() }; return observedThreadName }
+    var left: Int { state.lock(); defer { state.unlock() }; return leaveCount }
+
+    func join(ssid: String, passphrase: String) async throws {
+        await runOffTheCooperativePool {
+            let released = self.gate.wait(timeout: .now() + Self.patience) == .success
+            let name = Thread.current.name
+            self.state.lock()
+            self.releasedByPing = released
+            self.observedThreadName = name
+            self.state.unlock()
+        }
+    }
+
+    func leave() async { recordLeave() }
+
+    // Synchronous, like `SystemHotspotJoiner`'s accessors: NSLock's lock()/unlock()
+    // are `noasync`, so an async method must reach the lock through a sync helper.
+    private func recordLeave() { state.lock(); leaveCount += 1; state.unlock() }
+}
+
+/// A joiner that **suspends** rather than blocking, which is the programmatic
+/// joiner's shape: `NEHotspotConfiguration.apply` occupies no thread but still
+/// waits on a person tapping the iOS "wants to join" alert. Bounded the same way.
+struct SuspendingJoiner: HotspotJoining {
+    final class Box: @unchecked Sendable {
+        private let lock = NSLock()
+        private var released = false
+        private var leaveCount = 0
+        func markReleased() { lock.lock(); released = true; lock.unlock() }
+        var wasReleasedByAPing: Bool { lock.lock(); defer { lock.unlock() }; return released }
+        func markLeft() { lock.lock(); leaveCount += 1; lock.unlock() }
+        var left: Int { lock.lock(); defer { lock.unlock() }; return leaveCount }
+    }
+
+    let pinged = AsyncGate()
+    let box = Box()
+
+    func join(ssid: String, passphrase: String) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if pinged.isOpen {
+                box.markReleased()
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    func leave() async { box.markLeft() }
+}
+
+/// The defect, pinned. `join` blocks its thread far longer than the ping
+/// interval — the macOS shape, where somebody is in System Settings — and
+/// `APP&WPING` must be on the wire *while it is still blocked*.
+///
+/// The proof is causal rather than sampled: the joiner is released **by the ping
+/// itself**, so the run can only reach a successful transfer if a ping went out
+/// during the join. Reverting the fix (starting the keepalive after `join`
+/// instead of before it) makes `wasReleasedByAPing` false and the wire order
+/// wrong — a failure, not a hang, because the block gives up after 5 s.
+@Test func theKeepalivePingsWhileAThreadBlockingJoinIsStillWaiting() async throws {
+    let golden = try FakeTransport.loadGoldenFixture()
+    let server = try LoopbackServer(payload: golden)
+    defer { server.stop() }
+
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    let joiner = ThreadBlockingJoiner()
+    let polls = Counter()
+    t.onSend = { wire, transport in
+        switch wire {
+        case "APP&WIFIS":
+            // Off for the pre-flight query, associated for every later poll —
+            // the polls only begin once the join has returned.
+            transport.emitResponse(polls.next() == 1 ? "MCU&WIFIS&0" : "MCU&WIFIS&2")
+        case "APP&WPING":
+            joiner.unblock()   // the ping is what lets the join finish
+        default:
+            break
+        }
+    }
+    let session = PocketSession(transport: t, sessionKey: "K")
+    try await session.start()
+
+    let data = try await session.downloadOverWiFi(
+        recording,
+        endpointOverride: server.endpoint,
+        joiner: joiner,
+        readiness: WiFiReadiness(timeout: .seconds(10),
+                                 pollInterval: .milliseconds(5),
+                                 pingInterval: .milliseconds(50)))
+
+    #expect(data == golden)
+    // The join ended because a keepalive arrived, not because it gave up.
+    #expect(joiner.wasReleasedByAPing)
+    // And the wire agrees: the ping falls after the AP started and BEFORE the
+    // first association poll, and no poll can be issued until `join` returns —
+    // so that window IS the join.
+    let apStart = try #require(t.sent.firstIndex(of: "APP&WIFIO"))
+    let ping = try #require(t.sent.firstIndex(of: "APP&WPING"))
+    let associationPolls = t.sent.indices.filter { $0 > apStart && t.sent[$0] == "APP&WIFIS" }
+    #expect(apStart < ping)
+    #expect(!associationPolls.isEmpty)
+    #expect(ping < associationPolls[0])
+    // The blocking read never occupied a cooperative thread — the hand-off ran.
+    #expect(joiner.threadName == blockingWorkThreadName)
+    #expect(joiner.left == 1)
+    #expect(!t.sent.contains("APP&PING"))   // still not a real command
+    await session.stop()
+}
+
+/// The same protection for the programmatic joiner, which needs it for the same
+/// reason and gets it for free: the keepalive starts before `join` is called at
+/// all, so it covers any `HotspotJoining` that takes its time — this suspending
+/// one, the blocking one, or a consumer's own. `NEHotspotConfiguration.apply` is
+/// fast today, which is the only reason the phone path never hit this.
+@Test func theKeepaliveAlsoPingsThroughASuspendingJoin() async throws {
+    let golden = try FakeTransport.loadGoldenFixture()
+    let server = try LoopbackServer(payload: golden)
+    defer { server.stop() }
+
+    let t = FakeTransport()
+    scriptWiFiConversation(on: t)
+    let joiner = SuspendingJoiner()
+    let polls = Counter()
+    t.onSend = { wire, transport in
+        switch wire {
+        case "APP&WIFIS":
+            transport.emitResponse(polls.next() == 1 ? "MCU&WIFIS&0" : "MCU&WIFIS&2")
+        case "APP&WPING":
+            joiner.pinged.open()
+        default:
+            break
+        }
+    }
+    let session = PocketSession(transport: t, sessionKey: "K")
+    try await session.start()
+
+    let data = try await session.downloadOverWiFi(
+        recording,
+        endpointOverride: server.endpoint,
+        joiner: joiner,
+        readiness: WiFiReadiness(timeout: .seconds(10),
+                                 pollInterval: .milliseconds(5),
+                                 pingInterval: .milliseconds(50)))
+
+    #expect(data == golden)
+    #expect(joiner.box.wasReleasedByAPing)
+    let apStart = try #require(t.sent.firstIndex(of: "APP&WIFIO"))
+    let ping = try #require(t.sent.firstIndex(of: "APP&WPING"))
+    let associationPolls = t.sent.indices.filter { $0 > apStart && t.sent[$0] == "APP&WIFIS" }
+    #expect(apStart < ping)
+    #expect(!associationPolls.isEmpty)
+    #expect(ping < associationPolls[0])
+    await session.stop()
+}
+
+/// Why the hand-off is not a formality. Swift concurrency's cooperative pool has
+/// roughly one thread per core, and work that blocks one of them holds it: enough
+/// concurrent blocking joins and an async task — the keepalive, say — never gets a
+/// thread to run on at all, however "concurrent" it looks in the source.
+///
+/// So: run more blocking work than the pool has threads and require that ordinary
+/// async work is still scheduled. Bounded on both sides — the blocked work gives
+/// up after 3 s, the prober is waited for with a 2 s timeout — so reverting
+/// `runOffTheCooperativePool` to call `work()` inline fails this in seconds
+/// rather than wedging the suite.
+@Test func blockingWorkNeverOccupiesTheCooperativeThreadsAsyncWorkNeeds() async {
+    // Comfortably past the pool's width, whatever this machine's width is.
+    let width = ProcessInfo.processInfo.activeProcessorCount * 2 + 2
+    let parked = DispatchSemaphore(value: 0)
+    let probeRan = DispatchSemaphore(value: 0)
+
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<width {
+            group.addTask {
+                await runOffTheCooperativePool { _ = parked.wait(timeout: .now() + .seconds(3)) }
+            }
+        }
+        // Enqueued last, and trivial: with the blocking work inline on the pool,
+        // every thread is already held and this never runs.
+        group.addTask { probeRan.signal() }
+        // Waited for off the pool too, so this test does not itself hold one of
+        // the threads it is reasoning about (and so `wait`, which is `noasync`,
+        // is not called from an async context).
+        let scheduled = await runOffTheCooperativePool {
+            probeRan.wait(timeout: .now() + .seconds(2)) == .success
+        }
+        #expect(scheduled)
+        for _ in 0..<width { parked.signal() }
+    }
+}
+
+/// And the mechanism itself, stated directly: the work runs on a thread of its
+/// own, not the caller's.
+@Test func blockingWorkRunsOnItsOwnNamedThread() async {
+    let caller = currentThreadIdentity()
+    let observed = await runOffTheCooperativePool { currentThreadIdentity() }
+    #expect(observed.name == blockingWorkThreadName)
+    #expect(observed.thread != caller.thread)
+}
+
+/// Who is running this. An `ObjectIdentifier` rather than the `Thread` — a Thread
+/// is not Sendable — and a synchronous function, because `Thread.current` is
+/// `noasync` and this is deliberately asking about the thread.
+private func currentThreadIdentity() -> (name: String?, thread: ObjectIdentifier) {
+    (name: Thread.current.name, thread: ObjectIdentifier(Thread.current))
 }

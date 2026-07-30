@@ -13,6 +13,52 @@ notes for a release before upgrading.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every Wi-Fi transfer from a Mac failed, silently, for as long as the path has
+  existed — the keepalive did not cover the join.** `APP&WPING` started only after
+  `joiner.join(ssid:passphrase:)` returned. On macOS that join *is* a person:
+  `ManualHotspotJoiner` prints instructions and blocks on `readLine()` while the
+  operator opens System Settings, forgets a network the Mac remembers, finds the
+  SSID and types a password. On 2026-07-28 that pause was long enough for the
+  device's access point to come up, serve DHCP, and go away again before a byte was
+  asked for. The evidence, gathered on the Mac while still joined to the AP: a
+  valid `192.168.200.2` lease and a correct `en0` route, and `No route to host`
+  from both `ping 192.168.200.1` and `nc -vz 192.168.200.1 8475` — ARP unanswered,
+  the device no longer there at layer 2. The only symptom that reached the process
+  was `wifi tcp connect timed out after 30.0 seconds`.
+
+  The keepalive now starts **before** the join and runs until the session closes,
+  reusing the session-long pinger and the `WiFiReadiness.pingInterval` cadence
+  rather than adding a third mechanism. It therefore covers every
+  `HotspotJoining` — including `SystemHotspotJoiner`, which waits on the iOS
+  *"wants to join"* alert: the same shape of pause, merely faster today, which is
+  why the phone path never showed this. `ManualHotspotJoiner`'s `readLine()` now
+  runs on a thread of its own, off Swift concurrency's cooperative pool, because a
+  blocking read there can starve the very task that is supposed to be pinging. The
+  association wait touches the session's idle clock around its polls, exactly as
+  the TCP connect already did, so nothing double-pings. No new API, no wire-order
+  change on any path that was already working.
+
+- **A batched Wi-Fi run printed the raw failure instead of the diagnosis built for
+  it.** `sync-wifi` reported only
+  `STOPPED on 20260728003752: wifi tcp connect timed out after 30.0 seconds` — the
+  join-failure guidance added in the previous release enriched the
+  single-recording path only, so the transcript where the confusion actually
+  happened never saw it. The batch path now attaches the same diagnosis to a
+  terminal connect failure. A connect failure on a *reused* session is untouched:
+  that is a refusal the run repairs by restarting, not a failure to explain.
+
+- **A TCP connect that follows a successful association is no longer blamed on
+  credentials.** The 2026-07-28 failure was an access point that had gone away,
+  not a stale password, and pointing at the wrong cause costs more than a bare
+  error. What a failed connect now says depends on what the device reported: a
+  client on its AP (`MCU&WIFIS&2`) or its Wi-Fi off (`MCU&WIFIS&0`) both point at
+  the access point's lifetime and say nothing about passwords; only the AP up with
+  nothing ever on it (`MCU&WIFIS&3`) — the shape a stale credential makes — keeps
+  the credential guidance. Message text only: no new error case, no control-flow or
+  teardown change, and no credential in any of it.
+
 ### Added
 
 - **One Wi-Fi access-point session for a whole sync, instead of one per

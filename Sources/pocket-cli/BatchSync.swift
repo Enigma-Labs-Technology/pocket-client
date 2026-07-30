@@ -17,6 +17,27 @@
 import Foundation
 import PocketClient
 
+/// Greedy word wrap, so a multi-sentence failure diagnosis reads as prose in a
+/// captured transcript instead of as one line the terminal breaks wherever it
+/// happens to run out of width. Whitespace-collapsing by construction, which is
+/// what is wanted here: the input is a sentence, not layout.
+private func wrappedForTranscript(_ text: String, indent: String, width: Int = 76) -> String {
+    var lines: [String] = []
+    var current = ""
+    for word in text.split(whereSeparator: \.isWhitespace) {
+        if current.isEmpty {
+            current = String(word)
+        } else if current.count + 1 + word.count <= width {
+            current += " " + word
+        } else {
+            lines.append(current)
+            current = String(word)
+        }
+    }
+    if !current.isEmpty { lines.append(current) }
+    return lines.map { indent + $0 }.joined(separator: "\n")
+}
+
 /// Renders one recording's `WiFiSessionUse` as the finding it is.
 private func sessionUseLine(_ use: WiFiSessionUse) -> String {
     switch use {
@@ -103,9 +124,15 @@ func runWiFiBatchSync(device: PocketDevice, date: String, count: Int) async thro
     }
 
     if let stopped = result.stopped {
+        print("\n  STOPPED on \(stopped.recording.id.timestamp)")
+        // The reason is a paragraph now, not a line: a failed Wi-Fi transfer's
+        // diagnosis rides in it. That is the whole point — the 2026-07-28
+        // transcript of this command showed `wifi tcp connect timed out after
+        // 30.0 seconds` and nothing else, while the code that could have named the
+        // cause was one call away — so it is wrapped rather than run off the edge
+        // of the terminal.
+        print(wrappedForTranscript(stopped.reason, indent: "    "))
         print("""
-
-          STOPPED on \(stopped.recording.id.timestamp): \(stopped.reason)
             \(result.delivered.count) recording(s) before it were delivered and are on disk —
             a mid-batch failure never discards what already arrived.
             not attempted: \(stopped.remaining.isEmpty

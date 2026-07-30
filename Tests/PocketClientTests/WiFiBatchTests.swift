@@ -769,6 +769,100 @@ final class BatchProgressLog: @unchecked Sendable {
     await session.stop()
 }
 
+// MARK: - The batch's stop reason carries the diagnosis, not just the symptom
+//
+// 0.1.2 taught a failed Wi-Fi transfer to name its own likeliest cause so this
+// class of failure would explain itself. One release later a hardware `sync-wifi`
+// run printed, in full:
+//
+//     STOPPED on 20260728003752: wifi tcp connect timed out after 30.0 seconds
+//
+// — because the batch path rendered the raw error while only the single-recording
+// path enriched it. The feature built to prevent that confusion did not reach the
+// transcript where the confusion happened.
+
+/// Sixteen characters whose first eight are exactly the `ExampleK` the scripted
+/// device reports, so the diagnosis can find the device self-consistent.
+private let batchMatchingKey = "ExampleKey000000"
+
+/// Nothing listens on port 1, so a connect there is refused at once — a TCP
+/// connect that fails, without waiting out a timeout to get there.
+private let batchDeadEndpoint = NWEndpoint.hostPort(host: "127.0.0.1",
+                                                    port: NWEndpoint.Port(rawValue: 1)!)
+
+/// Short enough that the association wait resolves inside a test run.
+private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
+                                                pollInterval: .milliseconds(5),
+                                                pingInterval: .seconds(60))
+
+/// The stop reason must carry what the single-recording path throws — the device
+/// reported its AP up and nothing ever on it, which is the stale-credential shape,
+/// and the repair for it is a manual one no API can perform.
+@Test func aBatchStopsWithTheEnrichedConnectDiagnosisNotTheBareSymptom() async throws {
+    let recordings = wifiBatchRecordings(2)
+    let t = FakeTransport()
+    scriptWiFiBatchConversation(on: t, recordings: recordings)
+    t.script["APP&SK&\(batchMatchingKey)"] = ["MCU&SK&OK"]
+    t.script["APP&WIFIS"] = ["MCU&WIFIS&3"]   // AP up, never a client
+    let session = PocketSession(transport: t, sessionKey: batchMatchingKey)
+    try await session.start()
+
+    let joiner = RecordingJoiner(shouldFail: false)
+    let result = try await session.downloadOverWiFi(recordings,
+                                                    endpointOverride: batchDeadEndpoint,
+                                                    joiner: joiner,
+                                                    readiness: batchBriefReadiness)
+
+    #expect(result.delivered.isEmpty)
+    let stopped = try #require(result.stopped)
+    #expect(stopped.recording == recordings[0])
+    // The symptom the transcript used to show, and all of it …
+    #expect(stopped.reason.contains("wifi tcp connect"))
+    // … plus the diagnosis it used to omit.
+    #expect(stopped.reason.contains("the device never reported a client on its AP (no MCU&WIFIS&2)"))
+    #expect(stopped.reason.contains("nothing joined PKT01_EXAMPLE"))
+    #expect(stopped.reason.contains("exactly what this session's key implies"))
+    #expect(stopped.reason.contains("Forget PKT01_EXAMPLE in Wi-Fi settings"))
+    // Never a credential, so the transcript stays safe to paste into a report.
+    #expect(!stopped.reason.contains("ExampleK"))
+    // Nothing was left broadcasting, and the untried recording is named.
+    #expect(stopped.remaining == [recordings[1]])
+    #expect(joiner.box.left == 1)
+    #expect(t.sent.contains("APP&WIFIC"))
+    try await session.beginTransfer()
+    await session.endTransfer()
+    await session.stop()
+}
+
+/// And the failure that actually happened on 2026-07-28, in the path that
+/// happened to run it: the device DID report a client, so the host was on the AP
+/// and the credentials were accepted. The batch must not print the stale-password
+/// guidance here — a diagnosis that confidently names the wrong cause costs more
+/// than a bare error — and must point at the access point's lifetime instead.
+@Test func aBatchDoesNotBlameCredentialsForAConnectFailureAfterAnAssociation() async throws {
+    let recordings = wifiBatchRecordings(2)
+    let t = FakeTransport()
+    scriptWiFiBatchConversation(on: t, recordings: recordings)
+    t.script["APP&SK&\(batchMatchingKey)"] = ["MCU&SK&OK"]
+    scriptWiFiStateOracle(on: t, progression: healthyWiFiProgression)   // reaches MCU&WIFIS&2
+    let session = PocketSession(transport: t, sessionKey: batchMatchingKey)
+    try await session.start()
+
+    let result = try await session.downloadOverWiFi(recordings,
+                                                    endpointOverride: batchDeadEndpoint,
+                                                    joiner: RecordingJoiner(shouldFail: false),
+                                                    readiness: batchBriefReadiness)
+
+    let stopped = try #require(result.stopped)
+    #expect(stopped.reason.contains("wifi tcp connect"))
+    #expect(stopped.reason.contains("the device DID report a client on its access point"))
+    #expect(stopped.reason.contains("The access point's lifetime is what to spend less of"))
+    // The credential story is absent, in both of its recognisable forms.
+    #expect(!stopped.reason.contains("Forget"))
+    #expect(!stopped.reason.contains("never reported a client on its AP"))
+    await session.stop()
+}
+
 // MARK: - Cancellation, exclusivity, and the empty batch
 
 /// Cancelling mid-batch is the caller's, not a WiFi failure: it surfaces as

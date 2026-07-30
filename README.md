@@ -248,6 +248,7 @@ the index.
 | `MCU&RT` is one-shot | It fires once at connect when a recording is already running, and **never repeats**. Nothing on the wire advances elapsed time; any UI clock must run locally from that anchor. | [8 · Watch for events](#8--watch-for-events) |
 | Rotating the key breaks saved Wi-Fi | The AP password is the session key's first 8 characters and follows the live binding, but the SSID is the BLE name and does not change. Every host that joined before the rotation keeps offering the old password and fails, and **no app can clear a user-saved network** — it must be forgotten by hand. | [When the join fails](#when-the-join-fails) |
 | Ten bytes past the end | A Wi-Fi transfer's TCP stream carries a short trailer (10 bytes observed) past the announced length. The announced count is authoritative; drain-to-EOF overshoots and fails an exact-length check. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
+| The AP does not wait for the person joining it | The device brings its access point up on `APP&WIFIO` and takes it down again on its own. A manual join — System Settings, a stale network, a password — can outlast it, after which the host still holds a `192.168.200.x` lease and everything it sends gets `No route to host`. The keepalive spans the join for exactly this reason. | [The access point does not wait for you](#the-access-point-does-not-wait-for-you) |
 | One Wi-Fi session per recording means one join prompt per recording | `joinOnce = true` makes iOS discard the configuration on disassociation, so a ten-file sync asks the person to join ten times and pays the ~6.5 s association ten times. Batching them into one session avoids that — **if** the device serves a second selection, which nobody has ever tried. | [One access-point session for a whole sync](#one-access-point-session-for-a-whole-sync) |
 | `APP&SHUT` may never answer | On an idle device there is **no** `MCU&SHUT`. Blocking on the reply hangs the happy path. | [12 · Go below the session](#12--go-below-the-session) |
 | `APP&U&WIFI` is a modifier | It reroutes the upload already selected by `APP&U&<date>&<ts>` to the TCP socket. Sent alone it has nothing to reroute. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
@@ -860,7 +861,7 @@ public protocol HotspotJoining: Sendable {
 | Implementation | Platform | Behaviour | Evidence |
 |---|---|---|---|
 | `SystemHotspotJoiner` (default) | iOS | Joins programmatically via `NEHotspotConfiguration` with `joinOnce = true`. Requires the Hotspot Configuration entitlement **in the consuming app**, not in this package. Treats `alreadyAssociated` as success, so a half-failed earlier attempt does not silently degrade `.auto` to BLE. On macOS it throws `PocketError.wifiJoinFailed` naming the SSID and password. | `compile-only` on iOS |
-| `ManualHotspotJoiner` | macOS | Prints the SSID and password, blocks on `readLine()` until the operator joins in System Settings and presses return, then runs the transfer. Afterwards it says the operator may rejoin their normal network. It also warns that a Mac which joined this AP before a key rotation will silently reuse the old password — printing the right one is [demonstrably not enough](#when-the-join-fails). | `hardware` |
+| `ManualHotspotJoiner` | macOS | Prints the SSID and password, blocks on `readLine()` until the operator joins in System Settings and presses return, then runs the transfer. The read runs on a thread of its own, off Swift concurrency's cooperative pool, so the `APP&WPING` keepalive that spans the join keeps running while a person takes their time — see [The access point does not wait for you](#the-access-point-does-not-wait-for-you). Afterwards it says the operator may rejoin their normal network. It also warns that a Mac which joined this AP before a key rotation will silently reuse the old password — printing the right one is [demonstrably not enough](#when-the-join-fails). | `hardware` |
 
 ```swift
 // macOS harness
@@ -942,14 +943,21 @@ against the password the device just reported over BLE and state whether the
 | The reported password is **not** what the key implies | Reported as a firmware finding, explicitly *not* as this failure's cause: the join used the device's value, which is authoritative. Never an error in its own right. |
 | The key is shorter than the password | Says so, and claims nothing. (Real keys are 16 characters; only a hand-made short one gets here.) |
 
-Both shapes of the failure carry it — the join error, and a TCP connect that
-fails while the device reported **no** client on its AP (`APP&WIFIS` returning
-`3` and never `2`, which is the macOS shape). When the device *did* report an
-associated client, the message is left alone: the host is demonstrably on the AP,
-so cached credentials are not the story.
-
 Neither password appears in the message, so a failure stays safe to paste into a
 bug report.
+
+**The credential story is told only where the device's report supports it.** The
+join error always carries it. A TCP connect that never completes carries it only
+when the device reported its AP up with nothing ever on it (`APP&WIFIS` returning
+`3` and never `2`) — the shape a stale password makes. The other two shapes get
+their own text, because a diagnosis that confidently names the wrong cause is
+worse than a bare error:
+
+| What the device reported during setup | What a failed TCP connect says |
+|---|---|
+| A client on its AP (`MCU&WIFIS&2`, or `1`) | The host **was** associated and its credentials **were** accepted, so the password is not in question. Points at [the access point's lifetime](#the-access-point-does-not-wait-for-you) instead. |
+| Its Wi-Fi **off** (`MCU&WIFIS&0`) | The access point came down by itself before anything could connect. Also a lifetime problem, and explicitly not a credential this host holds. |
+| The AP up, nothing on it (`MCU&WIFIS&3`) | The stale-credential guidance above, and the manual repair. |
 
 **The repair is manual, and that is not an oversight.**
 `NEHotspotConfigurationManager.removeConfiguration(forSSID:)` removes only
@@ -964,6 +972,50 @@ up front, before the operator joins, because that is the only cheap moment.
 > characters.** It would hold the AP password stable and avoid the problem
 > entirely — and those eight characters are the credential you are rotating away
 > from. Keeping them leaves the old secret opening the access point.
+
+### The access point does not wait for you
+
+**Evidence:** `hardware` for the failure (2026-07-28, macOS joined to the
+recorder's AP); `unit` for the fix.
+
+The recorder brings its access point up on `APP&WIFIO` and does not hold it open
+indefinitely. On macOS the join is a *person* — open System Settings, forget a
+network the Mac remembers, find the SSID, type a password, come back — and that is
+easily a minute. Spend a minute there and the AP is gone before the transfer asks
+for a byte:
+
+```
+ifconfig en0                 → inet 192.168.200.2 netmask 0xffffff00   ← the lease arrived
+route -n get 192.168.200.1   → interface: en0, no gateway              ← the route is right
+ping 192.168.200.1           → No route to host                        ← ARP unanswered
+nc -vz 192.168.200.1 8475    → No route to host
+```
+
+`No route to host` on a directly-connected subnet with a valid interface route
+means nothing is answering ARP: the device had served DHCP minutes earlier and was
+no longer there. The only symptom that reached the process was
+`wifi tcp connect timed out after 30.0 seconds`.
+
+**So the `APP&WPING` keepalive spans the join itself**, not just the stretches
+after it. It starts before `joiner.join(ssid:passphrase:)` is called and runs until
+the session closes, so the BLE link — and with it the device's willingness to keep
+the AP up — survives a human-paced association. This is not specific to the manual
+joiner: `SystemHotspotJoiner` waits on the iOS *"wants to join"* alert, which is
+the same shape of pause and merely faster today, and a custom `HotspotJoining` gets
+the same protection because the keepalive is started before any joiner runs.
+
+**A blocking read has to leave the cooperative pool for that to be true.**
+`readLine()` blocks its thread for as long as the operator takes, and Swift
+concurrency's cooperative pool has roughly one thread per core — so a keepalive
+task that looks concurrent in the source can fail to run at all. The read
+therefore happens on a thread of its own, and the test suite proves both halves:
+that a ping reaches the wire while a join is still blocked, and that blocking work
+does not starve the pool.
+
+> [!TIP]
+> Reduce what the join costs. Join the network once before the transfer if you can,
+> and if the Mac has joined this SSID before a key rotation, forget it *first* — the
+> stale-password prompt is what turns a fast join into a slow one.
 
 ### Empty recordings
 
@@ -1337,7 +1389,7 @@ public enum PocketError: Error, Equatable {
 | `.deviceNotFound` | `connect(to:)` was given an identifier this system has never seen, or has forgotten (e.g. after a factory reset). Re-scan. |
 | `.busy` | One connection and one transfer at a time. The string says which guard fired. |
 | `.wifiJoinFailed` | The hotspot join failed, or `SystemHotspotJoiner` was used on macOS. The detail leads with the joiner's own text and then names the likeliest cause — usually a stale saved password left behind by a key rotation. See [When the join fails](#when-the-join-fails). |
-| `.transferFailed` | Carries a diagnostic string: GATT write failure, TCP connect failure, a stall, a disk error while streaming to a file. A TCP connect that failed while the device reported **no** client on its AP says so, and carries the same stale-credential diagnosis. |
+| `.transferFailed` | Carries a diagnostic string: GATT write failure, TCP connect failure, a stall, a disk error while streaming to a file. A failed TCP connect names the device's own report of its AP and the diagnosis that follows from it — a stale credential, or an access point that went away. See [When the join fails](#when-the-join-fails) and [The access point does not wait for you](#the-access-point-does-not-wait-for-you). |
 | `.disconnected` | The link dropped, was never established, or the instance is spent. |
 
 `pocket-cli` prints one line of triage per failure mode from this same table —

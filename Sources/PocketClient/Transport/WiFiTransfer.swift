@@ -18,6 +18,14 @@ public protocol HotspotJoining: Sendable {
 /// A class, not a struct: `leave()` must remove the configuration for the
 /// SSID that `join` actually applied, so the joined SSID is recorded under a
 /// lock (join and leave can run on different tasks).
+///
+/// Fast in practice — seconds — which is the only reason the phone path never hit
+/// the failure the macOS one did. It is not fast by construction: `apply` puts up
+/// the system *"wants to join Wi-Fi network"* alert and returns when the person
+/// answers it, which is the same shape of wait as the manual joiner's, just
+/// usually shorter. It needs no protection of its own because
+/// `openWiFiSession` starts the session keepalive before calling **any**
+/// `HotspotJoining` — this one, the manual one, or a consumer's.
 public final class SystemHotspotJoiner: HotspotJoining, @unchecked Sendable {
     private let lock = NSLock()
     private var joinedSSID: String?
@@ -73,8 +81,45 @@ public final class SystemHotspotJoiner: HotspotJoining, @unchecked Sendable {
     }
 }
 
+/// The name given to the thread `runOffTheCooperativePool` creates. Read by a
+/// test, so the hand-off is proved rather than assumed.
+let blockingWorkThreadName = "pocket-client.blocking-work"
+
+/// Runs `work` — which may block its thread for an unbounded time — on a thread
+/// of its own, suspending the caller until it returns.
+///
+/// `ManualHotspotJoiner` is the reason this exists. `readLine()` blocks until the
+/// operator presses return, and on 2026-07-28 that was about a minute spent in
+/// System Settings. Called straight from an `async` function, that minute is
+/// spent holding one of Swift concurrency's cooperative threads — a pool with
+/// roughly one thread per core — so the pool can stall, and a keepalive task that
+/// is nominally "running concurrently" may not run at all. A ping going out
+/// *during* that minute is the whole point (see `startWiFiSessionKeepalive`), so
+/// the blocking read has to leave the pool. Nothing here would fail loudly if it
+/// did not, which is exactly why it is a named function with a test on it.
+///
+/// A plain `Thread`, not a `DispatchQueue`: the work blocks for as long as a
+/// person takes, and a queue's threads are shared with everything else on it.
+///
+/// Deliberately **not** cancellable — a blocking read cannot be interrupted, and
+/// resuming early would leave the orphaned thread to swallow a later line of
+/// stdin. That matches the bare `readLine()` this replaces; nothing regressed.
+func runOffTheCooperativePool<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+    await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+        let thread = Thread { continuation.resume(returning: work()) }
+        thread.name = blockingWorkThreadName
+        thread.start()
+    }
+}
+
 /// A joiner for macOS harness runs: prints instructions and waits for the
 /// operator to join the AP by hand, then continues.
+///
+/// This join is a person, and takes as long as a person takes. Everything that
+/// has to keep happening meanwhile — the `APP&WPING` keepalive that stops the
+/// device's access point idling out from under the transfer — is arranged by
+/// `openWiFiSession`, which starts the session keepalive **before** calling any
+/// joiner.
 public struct ManualHotspotJoiner: HotspotJoining {
     public init() {}
     public func join(ssid: String, passphrase: String) async throws {
@@ -100,7 +145,11 @@ public struct ManualHotspotJoiner: HotspotJoining {
         (Bluetooth control stays up; only the file bytes travel over WiFi.)
         waiting for return…
         """)
-        _ = readLine()
+        // Off the cooperative pool. `readLine()` blocks its thread for as long
+        // as the operator takes, and the session keepalive that is now running
+        // behind this call needs a thread to run on — see
+        // `runOffTheCooperativePool`.
+        _ = await runOffTheCooperativePool { readLine() }
     }
     public func leave() async {
         // Runs on failure paths too, so it must not claim success.
@@ -184,6 +233,77 @@ enum WiFiJoinDiagnosis: Equatable, Sendable, CaseIterable {
     }
 }
 
+/// What this package can say about a TCP connect that never completed, once the
+/// device's own report on its access point is taken into account.
+///
+/// `WiFiJoinDiagnosis` answers exactly one question — were the credentials
+/// current? — and on 2026-07-28 that was the wrong question. The Mac was
+/// demonstrably ON the access point: `ifconfig en0` held `192.168.200.2`, the
+/// client address from the capture, so association and DHCP had both succeeded.
+/// The transfer still failed, and by the time it ran both `ping 192.168.200.1`
+/// and `nc -vz 192.168.200.1 8475` answered **No route to host** — which, on a
+/// directly-connected subnet with a valid interface route and no hijacked
+/// gateway, means ARP went unanswered: the device was no longer there at layer 2.
+/// The access point had come up, served DHCP, and gone away again while the
+/// operator was in System Settings.
+///
+/// A diagnosis that confidently names the wrong cause is worse than a bare error,
+/// so the credential story is told only where the device's report is consistent
+/// with it — the AP up, and nothing ever on it. Where the device reported a
+/// client, or reported its WiFi off from under us, the subject is the access
+/// point's lifetime and the text says so and says nothing about passwords.
+enum WiFiConnectDiagnosis: Equatable, Sendable {
+    /// The device reported a client on its AP (`MCU&WIFIS&2`, or `1` which
+    /// subsumes it) and the socket still never opened. The host was associated,
+    /// so the credentials are settled and out of the picture.
+    case associatedThenUnreachable
+    /// The device reported its WiFi **off** (`MCU&WIFIS&0`) while this client was
+    /// still waiting for the association: the access point came down on its own,
+    /// and no credential ever got the chance to be wrong.
+    case accessPointClosedItself
+    /// The device kept reporting its AP up with nothing on it (`MCU&WIFIS&3`, and
+    /// never `2`) — the shape a stale saved password makes, where the join is
+    /// attempted, silently rejected, and neither OS says why.
+    case nothingEverJoined(WiFiJoinDiagnosis)
+
+    /// The repair for both access-point-lifetime cases. It deliberately says
+    /// nothing about saved passwords: the device's own report has ruled that
+    /// story out here, and repeating it anyway is how a diagnosis starts costing
+    /// more than it saves.
+    private static func lifetimeRepair(ssid: String) -> String {
+        "The access point's lifetime is what to spend less of: the device brings it up on "
+        + "APP&WIFIO and does not hold it open indefinitely, so every second between the join "
+        + "and this connect is charged against it. On macOS the join is a person — System "
+        + "Settings, a network to find, a password to type — which is easily a minute, and a "
+        + "minute is enough. Join \(ssid) promptly, stay on it, and run this again. The "
+        + "signature that confirms it, from the host side: `ifconfig` still showing a "
+        + "\(WiFiEndpoint.clientSubnet) address while `ping \(WiFiEndpoint.deviceHost)` answers "
+        + "`No route to host` — that address is a DHCP lease the device has stopped answering "
+        + "ARP for."
+    }
+
+    /// Reads after the failure text, in the register the rest of the package
+    /// uses: what is known, then what to do about it.
+    func guidance(ssid: String) -> String {
+        switch self {
+        case .associatedThenUnreachable:
+            return "the device DID report a client on its access point (MCU&WIFIS&2), so this host "
+                + "was associated and its credentials were accepted — nothing about the password "
+                + "is in question. The socket then never opened, which means the access point "
+                + "stopped answering after the association rather than ever refusing it. "
+                + Self.lifetimeRepair(ssid: ssid)
+        case .accessPointClosedItself:
+            return "the device reported its WiFi off (MCU&WIFIS&0) while this client was still "
+                + "waiting for the association, so the access point came down before anything "
+                + "could connect to it — that is the device's doing, not a credential this host "
+                + "holds. " + Self.lifetimeRepair(ssid: ssid)
+        case .nothingEverJoined(let join):
+            return "the device never reported a client on its AP (no MCU&WIFIS&2), so nothing "
+                + "joined \(ssid): " + join.guidance(ssid: ssid)
+        }
+    }
+}
+
 /// Tuning for the post-join readiness wait: the official app polls
 /// `APP&WIFIS` about once a second until the device reports the client
 /// association (`MCU&WIFIS&2`), then switches to `APP&WPING` keepalives every
@@ -219,6 +339,11 @@ enum WiFiEndpoint {
     /// The device serves the file at this address once a client joins its AP.
     static let deviceHost = "192.168.200.1"
     static let devicePort: UInt16 = 8475
+    /// The subnet the device's DHCP server leases from — `192.168.200.2` in the
+    /// capture and on hardware. Named because `WiFiConnectDiagnosis` quotes it:
+    /// still holding one of these addresses while the device answers nothing is
+    /// the signature of an access point that has gone away.
+    static let clientSubnet = "192.168.200.x"
 
     static var `default`: Network.NWEndpoint {
         .hostPort(host: Network.NWEndpoint.Host(deviceHost),
@@ -545,7 +670,8 @@ extension PocketSession {
             } catch {
                 throw diagnosed(connectFailure: error, ssid: session.ssid,
                                 passphrase: session.passphrase,
-                                clientAssociationObserved: session.clientAssociationObserved)
+                                clientAssociationObserved: session.clientAssociationObserved,
+                                lastReportedState: session.lastReportedState)
             }
             do {
                 // 7. Select, reroute, read exactly the announced bytes, verify.
@@ -583,8 +709,22 @@ extension PocketSession {
         /// diagnosis: the device is the only witness to whether anything ever
         /// joined the AP it was broadcasting.
         let clientAssociationObserved: Bool
+        /// The last `MCU&WIFIS&<n>` the association wait actually saw, or `nil`
+        /// when the device answered none. Distinguishes an access point that came
+        /// down (`0`) from one that stayed up with nobody on it (`3`) — two
+        /// failures with one symptom and opposite causes, which is the whole
+        /// reason `WiFiConnectDiagnosis` needs it.
+        let lastReportedState: WiFiState?
         let activity: ActivityMonitor
         let keepalive: Task<Void, Never>
+    }
+
+    /// What the association wait saw. `observed` is the readiness signal the call
+    /// site is deliberately lenient about; `lastReportedState` is evidence kept
+    /// for the failure message, never for control flow.
+    private struct WiFiAssociationWait {
+        let observed: Bool
+        let lastReportedState: WiFiState?
     }
 
     /// Steps 1–5 of the capture-verified sequence: abort anything in flight,
@@ -631,6 +771,35 @@ extension PocketSession {
             throw error
         }
 
+        // The session keepalive starts HERE — before the join, not after it.
+        //
+        // On macOS the join IS a person: `ManualHotspotJoiner` prints instructions
+        // and blocks on `readLine()` while the operator opens System Settings,
+        // forgets a stale network, finds the SSID and types a password. On
+        // 2026-07-28 that pause was long enough for the device's access point to
+        // come up, serve DHCP, and go away again before a single byte was asked
+        // for — after which the Mac still held a `192.168.200.x` lease and
+        // everything it aimed at the device answered `No route to host`, because
+        // nothing was answering ARP any more. Every downstream symptom, up to and
+        // including `wifi tcp connect timed out after 30.0 seconds`, follows from
+        // that one pause.
+        //
+        // `awaitWiFiClientJoined` pings for exactly this reason — its own comment
+        // says a "possibly human-paced association" must not idle out the BLE link
+        // — and it starts one step too late to see the human. Starting the
+        // session-long keepalive before the join covers that stretch and every
+        // later one with a single mechanism, and covers every `HotspotJoining`
+        // rather than just the blocking one: `SystemHotspotJoiner` waits on an iOS
+        // permission alert, which is the same shape of pause and merely faster
+        // today.
+        let activity = ActivityMonitor()
+        let keepalive = startWiFiSessionKeepalive(activity, readiness: readiness)
+        // Every failure exit below must stop it; only the returned handle takes
+        // ownership. A defer rather than a line per catch, so a path added later
+        // cannot leak a pinger onto a closed access point.
+        var handedOver = false
+        defer { if !handedOver { keepalive.cancel() } }
+
         do {
             try await joiner.join(ssid: ssid, passphrase: passphrase)
         } catch {
@@ -643,19 +812,20 @@ extension PocketSession {
             // connect only after the device reports the association, and
             // connecting earlier just burns the timeout against a network
             // that is not routing yet.
-            let observedJoin = try await awaitWiFiClientJoined(readiness)
-            if !observedJoin {
+            let wait = try await awaitWiFiClientJoined(readiness, sessionActivity: activity)
+            if !wait.observed {
                 // Lenient by design: if this firmware's state machine differs
                 // from the capture, do not block a transfer that would work —
                 // but make sure the fact is visible to the CLI/checkpoint.
                 emitEvent(.wifiReadinessNotObserved)
             }
-            let activity = ActivityMonitor()
+            handedOver = true
             return WiFiSessionHandle(
                 ssid: ssid, passphrase: passphrase,
-                clientAssociationObserved: observedJoin,
+                clientAssociationObserved: wait.observed,
+                lastReportedState: wait.lastReportedState,
                 activity: activity,
-                keepalive: startWiFiSessionKeepalive(activity, readiness: readiness))
+                keepalive: keepalive)
         } catch {
             // Past the join, so the full teardown applies.
             try? await send(.wifiShutdown)
@@ -698,6 +868,11 @@ extension PocketSession {
     /// pinger never saw: between one recording's `MCU&OFF` and the next one's
     /// selection, and across the integrity check and file publish. This task
     /// spans the whole session instead.
+    ///
+    /// **Including the join.** It is started before `joiner.join` rather than
+    /// after it (see `openWiFiSession`), because the longest silence in the whole
+    /// sequence is the one where a person joins the network by hand — and that is
+    /// the silence that cost every macOS Wi-Fi transfer up to 0.1.3.
     ///
     /// It reads `ActivityMonitor.idleSince()` — the clock the TCP reader already
     /// touches on every chunk — rather than timing itself, so a ping goes out
@@ -748,57 +923,80 @@ extension PocketSession {
             "\(detail) — \(wifiJoinDiagnosis(reportedPassphrase: passphrase).guidance(ssid: ssid))")
     }
 
-    /// A TCP connect that fails while the device never reported a client on its
-    /// AP is the shape this failure takes on the macOS path, where the join
-    /// cannot fail: the operator pressed return, nothing associated, and the
+    /// A TCP connect that never completes is the shape this failure takes on the
+    /// macOS path, where the join cannot fail: the operator pressed return and the
     /// only symptom reaching the process is a socket that never opens
-    /// (`wifi tcp connect timed out after 30.0 seconds`, on 2026-07-28). The
-    /// device is the witness here — it says whether *any* client ever
-    /// associated with the AP it was broadcasting — so the guidance is added
-    /// only when it saw none. When the association *was* observed the text is
-    /// left alone: the host is demonstrably on the AP, so cached credentials
-    /// are not the story and saying otherwise would be noise.
+    /// (`wifi tcp connect timed out after 30.0 seconds`, on 2026-07-28).
+    ///
+    /// The device is the witness, and which of two opposite stories it tells
+    /// decides the guidance — see `WiFiConnectDiagnosis`. It reported a client, so
+    /// the host was on the AP and the credentials are irrelevant; it reported its
+    /// WiFi off, so the AP came down by itself; or it reported the AP up with
+    /// nobody on it, which is the stale-credential shape and the only case that
+    /// gets the credential text. The earlier version added credential guidance to
+    /// the first case not at all and to the second one wrongly, and a diagnosis
+    /// that names the wrong cause is worse than a bare error.
     ///
     /// Message only. The error case, the control flow, and the AP teardown are
     /// unchanged, and `CancellationError` passes through untouched.
     private func diagnosed(connectFailure error: Error, ssid: String, passphrase: String,
-                           clientAssociationObserved: Bool) -> Error {
-        guard !clientAssociationObserved,
-              case PocketError.transferFailed(let detail) = error else { return error }
-        return PocketError.transferFailed(
-            "\(detail) — the device never reported a client on its AP (no MCU&WIFIS&2), so nothing "
-            + "joined \(ssid): "
-            + wifiJoinDiagnosis(reportedPassphrase: passphrase).guidance(ssid: ssid))
+                           clientAssociationObserved: Bool,
+                           lastReportedState: WiFiState?) -> Error {
+        guard case PocketError.transferFailed(let detail) = error else { return error }
+        let diagnosis: WiFiConnectDiagnosis
+        if clientAssociationObserved {
+            diagnosis = .associatedThenUnreachable
+        } else if lastReportedState == .off {
+            diagnosis = .accessPointClosedItself
+        } else {
+            diagnosis = .nothingEverJoined(wifiJoinDiagnosis(reportedPassphrase: passphrase))
+        }
+        return PocketError.transferFailed("\(detail) — \(diagnosis.guidance(ssid: ssid))")
     }
 
     /// Polls `APP&WIFIS` until the device reports `.clientJoined` (2) — or
     /// `.tcpConnected` (1), which subsumes it — sending `APP&WPING`
     /// keepalives between polls so a slow (possibly human-paced) association
-    /// cannot idle out the BLE link. Returns `false` when `readiness.timeout`
-    /// elapses without either state being observed — deliberately not an
-    /// error (see the call site). Throws only for caller cancellation and a
-    /// dead session.
-    private func awaitWiFiClientJoined(_ readiness: WiFiReadiness) async throws -> Bool {
+    /// cannot idle out the BLE link. Reports `observed: false` when
+    /// `readiness.timeout` elapses without either state being observed —
+    /// deliberately not an error (see the call site) — and carries the last state
+    /// the device did report, which is what tells an access point that came down
+    /// from one nobody joined. Throws only for caller cancellation and a dead
+    /// session.
+    ///
+    /// `sessionActivity` is touched around every poll and every ping, exactly as
+    /// `connectKeepingLinkAlive` does it: the session keepalive fires only after
+    /// `pingInterval` of genuine silence, so this stretch's own traffic keeps it
+    /// off the wire instead of doubling it.
+    private func awaitWiFiClientJoined(_ readiness: WiFiReadiness,
+                                       sessionActivity: ActivityMonitor?) async throws
+        -> WiFiAssociationWait {
         let clock = ContinuousClock()
         let deadline = clock.now + readiness.timeout
         var lastPing = clock.now
+        var lastReportedState: WiFiState?
         while clock.now < deadline {
             try Task.checkCancellation()
             guard isAuthenticated else { throw PocketError.notAuthenticated }
+            sessionActivity?.touch()
             let response = try? await request(.wifiStatus, timeout: .seconds(2)) {
                 if case .wifiState = $0 { true } else { false }
             }
-            if case .wifiState(let state)? = response,
-               state == .clientJoined || state == .tcpConnected {
-                return true
+            sessionActivity?.touch()
+            if case .wifiState(let state)? = response {
+                lastReportedState = state
+                if state == .clientJoined || state == .tcpConnected {
+                    return WiFiAssociationWait(observed: true, lastReportedState: state)
+                }
             }
             if clock.now - lastPing >= readiness.pingInterval {
                 _ = try? await request(.wifiKeepalive, timeout: .seconds(2)) { $0 == .pong }
+                sessionActivity?.touch()
                 lastPing = clock.now
             }
             try? await Task.sleep(for: readiness.pollInterval)
         }
-        return false
+        return WiFiAssociationWait(observed: false, lastReportedState: lastReportedState)
     }
 
     /// After a teardown, waits for the device to report its WiFi actually **off**
@@ -1439,11 +1637,26 @@ extension PocketSession {
             return .cancelled
         } catch {
             sink.abort()
-            let text = wifiFailureText(error)
-            return reusingSession
-                ? .refused("the device did not accept a second TCP connection on :8475 — it "
-                           + "stopped listening after the previous recording: \(text)")
-                : .failed(text, error as? PocketError)
+            if reusingSession {
+                // Not terminal: the live session would not take a second socket,
+                // so this recording gets a fresh one. No diagnosis belongs on a
+                // refusal — the run is about to repair it itself.
+                return .refused("the device did not accept a second TCP connection on :8475 — it "
+                                + "stopped listening after the previous recording: "
+                                + wifiFailureText(error))
+            }
+            // A terminal connect failure, and the one the hardware run of
+            // 2026-07-28 hit. It must carry the same diagnosis the
+            // single-recording path attaches (`diagnosed(connectFailure:…)`),
+            // because THIS is the text a batch prints as its stop reason: the
+            // enrichment 0.1.2 added for exactly this failure never reached the
+            // transcript, which reported only `wifi tcp connect timed out after
+            // 30.0 seconds` and left the cause to be found by hand.
+            let enriched = diagnosed(connectFailure: error, ssid: session.ssid,
+                                     passphrase: session.passphrase,
+                                     clientAssociationObserved: session.clientAssociationObserved,
+                                     lastReportedState: session.lastReportedState)
+            return .failed(wifiFailureText(enriched), enriched as? PocketError)
         }
 
         let announced: Int
