@@ -381,7 +381,12 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
 /// pending, which wedged `connectKeepingLinkAlive` forever — holding the
 /// transfer slot with the AP up. The injected `connect` completes only once
 /// a WPING is on the wire, so the race is pinned, not sampled.
-@Test func tcpReadyWhileAWpingRequestIsArmedDoesNotWedgeTheConnect() async throws {
+///
+/// The wedge is the failure mode, and a wedge is *forever* — so the test's time
+/// limit is what catches it. A stopwatch read after the connect could not: a
+/// connect that never returns never reaches the line that reads one.
+@Test(.timeLimit(.minutes(1)))
+func tcpReadyWhileAWpingRequestIsArmedDoesNotWedgeTheConnect() async throws {
     let t = FakeTransport()
     t.script["APP&SK&K"] = ["MCU&SK&OK"]
     t.script["APP&BAT"] = ["MCU&BAT&64"]
@@ -393,8 +398,6 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
     let pingArmed = AsyncGate()
     t.onSend = { wire, _ in if wire == "APP&WPING" { pingArmed.open() } }
 
-    let clock = ContinuousClock()
-    let began = clock.now
     let connection = try await session.connectKeepingLinkAlive(
         to: WiFiEndpoint.default,
         readiness: WiFiReadiness(timeout: .seconds(30),
@@ -405,9 +408,6 @@ func scriptWIFIStateMachine(on t: FakeTransport, apUpPolls: Int = 1) {
             return NWConnection(to: endpoint, using: .tcp)   // stand-in; never started
         })
     connection.cancel()
-    // Prompt: well under the 2 s WPING request timeout and the 30 s connect
-    // budget — the armed waiter was failed by cancellation, not waited out.
-    #expect(clock.now - began < .seconds(1))
 
     // The request slot came back: a later request answers instead of `.busy`.
     let response = try await session.request(.battery) {
@@ -649,16 +649,49 @@ func hostHolding(_ addresses: (interface: String, address: String)...) -> HostIn
     #expect(loopback.linkIsRunning)
 }
 
+/// The bounded wait every `NWPathMonitor` read here sits behind, on a clock the
+/// test owns.
+///
+/// What it guarantees is a duration — a monitor with nothing to say must never
+/// hold a transfer up — and that is checked exactly: a source that never answers
+/// costs the bound and not a microsecond more, and one that answers is not made to
+/// wait out the rest of it. Nothing sleeps, so this cannot be turned red by a
+/// loaded machine.
+@Test func theBoundedPollGivesUpAtItsBoundWithoutSleepingOnTheWallClock() async {
+    let silent = VirtualClock()
+    let never = await HostInterfaces.poll(within: .seconds(30), on: silent,
+                                          step: .milliseconds(5)) { Int?.none }
+    #expect(never == nil)
+    #expect(silent.elapsed == .seconds(30))
+
+    // An answer on the third look ends it there, with the rest of the bound
+    // unspent.
+    let prompt = VirtualClock()
+    let looks = Counter()
+    let answered = await HostInterfaces.poll(within: .seconds(30), on: prompt,
+                                             step: .milliseconds(5)) {
+        looks.next() < 3 ? nil : 7
+    }
+    #expect(answered == 7)
+    #expect(prompt.elapsed == .milliseconds(10))
+
+    // A bound shorter than the step is still honoured: the step is floored to it,
+    // so a caller asking for a 1 ms wait does not get a 5 ms one.
+    let tiny = VirtualClock()
+    _ = await HostInterfaces.poll(within: .milliseconds(1), on: tiny,
+                                  step: .milliseconds(5)) { Int?.none }
+    #expect(tiny.elapsed == .milliseconds(1))
+}
+
 /// The wired-default-route probe reads `NWPathMonitor`, so what it answers on any
-/// given machine is that machine's business — but it must answer, promptly, and
-/// never hang a transfer waiting for a monitor that has nothing to say.
-@Test func theWiredDefaultRouteProbeAnswersWithinItsBound() async throws {
-    let clock = ContinuousClock()
-    let started = clock.now
-    _ = await HostInterfaces.defaultPathIsWired(within: .milliseconds(200))
-    // Generous against CI scheduling, and still far short of the 30 s connect it
-    // sits in front of.
-    #expect(clock.now - started < .seconds(3))
+/// given machine is that machine's business — and this deliberately ignores the
+/// answer. What it holds is that the probe *returns*, inside its bound, on a host
+/// whose monitor may say nothing at all: a warning that cannot be substantiated is
+/// omitted, never waited for.
+@Test func theWiredDefaultRouteProbeAnswersWithinItsBound() async {
+    let clock = VirtualClock()
+    _ = await HostInterfaces.defaultPathIsWired(within: .milliseconds(200), on: clock)
+    #expect(clock.elapsed <= .milliseconds(200))
 }
 
 /// The same seam with `IFF_RUNNING` stated per interface — the one piece of
@@ -1098,84 +1131,203 @@ func hostHoldingLinks(
     #expect(WiFiEndpoint.ipv4Host(of: .unix(path: "/tmp/x")) == nil)
 }
 
-/// What the pin builds for Network.framework, and — as importantly — what it does
-/// **not** build. `requiredInterface` is the whole pin: measured as strictly
-/// enforced on this SDK, unlike `requiredLocalEndpoint`, which was ignored
-/// outright. Nothing else is set, so a connection that could not be pinned is a
-/// plain `NWParameters.tcp` and nothing more.
-@Test func thePinnedParametersRequireTheInterfaceAndConstrainNothingElse() {
+/// What the pin starts a connection from, and — as importantly — what it does
+/// **not**. `requiredInterface` is the whole pin: measured as strictly enforced on
+/// this SDK, unlike `requiredLocalEndpoint`, which was ignored outright. Nothing
+/// else is set, so a connection that could not be pinned is a plain
+/// `NWParameters.tcp` and nothing more.
+@Test func thePinnedParametersConstrainNothingUntilAnInterfaceIsRequired() {
     let physical = WiFiPathPin.interface(
         HostInterfaceAddress(interfaceName: "en0", address: "192.168.200.2"),
         deviceSubnet: "192.168.200", alsoOnSubnet: [])
     #expect(physical.interfaceName == "en0")
     #expect(WiFiPathPin.noSubnetToCompare.interfaceName == nil)
 
-    // No pin: byte for byte the parameters that shipped before any of this
-    // existed. An earlier version prohibited interface *types* here, inferred
-    // from the chosen interface's name — an inference that bought nothing where
-    // the pin applied and could prohibit the needed interface where it did not,
-    // arriving as a silent `.waiting` that reads exactly like the defect being
-    // fixed. It is gone, and this is what holds it gone.
+    // Byte for byte the parameters that shipped before any of this existed. An
+    // earlier version prohibited interface *types* here, inferred from the chosen
+    // interface's name — an inference that bought nothing where the pin applied
+    // and could prohibit the needed interface where it did not, arriving as a
+    // silent `.waiting` that reads exactly like the defect being fixed. It is
+    // gone, and this is what holds it gone.
     for pin in [WiFiPathPin.noSubnetToCompare, physical] {
-        let parameters = pin.tcpParameters(requiring: nil)
+        let parameters = pin.tcpParameters
         #expect(parameters.requiredInterface == nil)
         #expect(parameters.prohibitedInterfaceTypes == nil)
         #expect(parameters.prohibitedInterfaces == nil)
         #expect(parameters.requiredLocalEndpoint == nil)
+        // …and the test fake's mark is not here either, so a test that sees it
+        // sees the fake and not a default.
+        #expect(!ListedInterfacePinning.isMarked(parameters))
     }
 }
 
-/// The last mile of the parameter builder, which no synthetic value can reach:
-/// `NWInterface` has no public initializer, so the only one that exists comes
-/// from a live `NWPath`. What this cannot show is that `connect` *uses* what the
-/// builder returns — see `theConnectAppliesThePinToTheSocketItOpens`, which does.
-///
-/// Passive: `NWPathMonitor` reads the system's own path state and sends nothing.
-/// A host that lists no interface at all cannot exercise a pin, and this says so
-/// rather than passing while asserting nothing.
-@Test func requiringAnInterfaceTheFrameworkListsIsAppliedToTheParameters() async throws {
-    let listed = await HostInterfaces.availableInterfaces(within: .milliseconds(500))
-    let interface = try #require(
-        listed.first,
-        "this host lists no available network interface, so the pin cannot be exercised")
-    let pin = WiFiPathPin.interface(
-        HostInterfaceAddress(interfaceName: interface.name, address: "192.168.200.2"),
-        deviceSubnet: "192.168.200", alsoOnSubnet: [])
-    #expect(pin.tcpParameters(requiring: interface).requiredInterface == interface)
-}
+// MARK: - The interface pin, held hermetically
+//
+// These three replace a pair that asked the real machine for an `NWInterface`.
+// That type has no public initializer, so the only one that exists comes from a
+// live `NWPath` — and a GitHub runner's `NWPathMonitor` lists none at all, so
+// `try #require(listed.first)` failed on every CI run. A check that errors in the
+// environment which gates merges is not holding anything.
+//
+// The seam is `WiFiInterfacePinning`, drawn at the level the production code can
+// state in its own types: an interface *name*, which is what
+// `HostInterfaceAddress.interfaceName` already is. Everything the pin decides is
+// on this side of it and is checked below without asking this machine for
+// anything. Only the SDK's enforcement of `requiredInterface` is left to the two
+// checks further down, which skip when the host lists no interface.
 
-/// **The pin, proved on the socket `TCPFetch.connect` actually opens** — not on
-/// the parameters a builder hands back.
+/// **The pin reaches the socket.** The parameters the pinner constrained are, by
+/// identity, the parameters `NWConnection` was opened with — not a copy taken
+/// afterwards, which is a pin that quietly reaches nothing.
 ///
-/// Every other integration test here reaches its endpoint over loopback, and
-/// Network.framework does not list the loopback interface, so the chosen
-/// interface resolves to nil and the parameters are indistinguishable from a
-/// plain `.tcp`. That made the headline fix invisible: reverting the connect to
-/// `NWConnection(to: endpoint, using: .tcp)`, or collapsing the interface lookup
-/// to nil, passed the entire suite. A test that survives its own mutation is the
-/// defect.
-///
-/// So this observes the pin's *effect* instead. Requiring an interface that
-/// cannot carry loopback traffic must make a connect to a live loopback listener
-/// fail, while the identical connect with nothing required succeeds — a causal
-/// pair, because only a connection that really was constrained can fail against a
-/// listener that is demonstrably up. Measured behaviour, not a guess: requiring
-/// `en0` of a loopback destination sits in
-/// `.waiting(POSIXErrorCode 50: Network is down)`.
-@Test func theConnectAppliesThePinToTheSocketItOpens() async throws {
+/// This is the mutation guard the old loopback test was: reverting the connect to
+/// `NWConnection(to: endpoint, using: .tcp)` leaves the socket carrying parameters
+/// the pinner never touched, and both assertions below go red. It costs no real
+/// interface, because the fake's mark stands in for the one assignment a fake
+/// cannot make.
+@Test func theConnectOpensTheSocketWithTheVeryParametersThePinWasAppliedTo() async throws {
     let server = try LoopbackServer(payload: Data([0xFF, 0xF3]))
     defer { server.stop() }
 
-    // Any interface Network.framework lists. None of them is loopback — that is
-    // the whole reason the loopback tests go unpinned — so none of them can carry
-    // a connection to 127.0.0.1.
-    let listed = await HostInterfaces.availableInterfaces(within: .milliseconds(500))
-    let carrier = try #require(
-        listed.first { $0.type != .loopback },
-        "this host lists no non-loopback interface, so an applied pin cannot be distinguished")
+    let pinning = ListedInterfacePinning(listing: ["en0"])
+    // Claim `en0` holds the endpoint's own address, so `choose` picks it and the
+    // connect is obliged to require it.
+    let pin = WiFiPathPin.choose(
+        reaching: server.endpoint,
+        among: [HostInterfaceAddress(interfaceName: "en0", address: "127.0.0.1")])
+    #expect(pin.interfaceName == "en0")
 
-    // Claim that interface holds the endpoint's own address, so `choose` picks it
-    // and `connect` is obliged to require it.
+    let connection = try await TCPFetch.connect(to: server.endpoint, timeout: .seconds(5),
+                                                pin: pin, interfaces: pinning)
+    defer { connection.cancel() }
+
+    // Asked for the pin's interface, once, inside the interface-snapshot bound.
+    #expect(pinning.asked.map(\.name) == ["en0"])
+    #expect(pinning.asked.first?.bound == WiFiReadiness.maximumInterfaceSnapshotWait)
+    // And what it constrained is what the socket carries.
+    #expect(connection.parameters === pinning.handedParameters)
+    #expect(ListedInterfacePinning.isMarked(connection.parameters))
+}
+
+/// **What the connect reports as pinned is what was really required of it** — and
+/// nothing when nothing was.
+///
+/// Collapsing the interface lookup to nil is the second mutation the old test
+/// existed to catch; it goes red on the first half. Reporting the *chosen*
+/// interface rather than the *required* one — implying a pin that was never
+/// applied — goes red on the second, which is the difference between "pinned and
+/// still failed" and "could not pin", two quite different next steps.
+@Test func theConnectReportsTheInterfaceThePinnerRequired() async throws {
+    let pin = WiFiPathPin.choose(
+        reaching: deadEndpoint,
+        among: [HostInterfaceAddress(interfaceName: "en0", address: "127.0.0.1")])
+
+    // Listed: required, and said so.
+    let listing = ListedInterfacePinning(listing: ["en0"])
+    let required = try #require(await connectFailure(to: deadEndpoint, pin: pin, interfaces: listing))
+    #expect(required.pinnedInterface == "en0")
+    #expect(required.detail.contains("the connection required en0"))
+
+    // Not listed — the ordinary loopback case: unpinned, and the message says so
+    // instead of implying a constraint that was never applied.
+    let absent = ListedInterfacePinning(listing: ["en7"])
+    let unpinned = try #require(await connectFailure(to: deadEndpoint, pin: pin, interfaces: absent))
+    #expect(unpinned.pinnedInterface == nil)
+    #expect(unpinned.detail.contains(
+        "Network.framework does not list it among its available interfaces"))
+    // It was still asked — "not listed" is an answer, not a lookup that was skipped.
+    #expect(absent.asked.map(\.name) == ["en0"])
+}
+
+/// A pin with no interface to require never consults Network.framework at all,
+/// and the socket is opened unconstrained — byte for byte what shipped before any
+/// of this existed.
+@Test func aPinWithNothingToRequireLeavesTheSocketUnconstrained() async throws {
+    let server = try LoopbackServer(payload: Data([0xFF, 0xF3]))
+    defer { server.stop() }
+
+    let pinning = ListedInterfacePinning(listing: ["en0"])
+    let connection = try await TCPFetch.connect(to: server.endpoint, timeout: .seconds(5),
+                                                pin: .noSubnetToCompare, interfaces: pinning)
+    defer { connection.cancel() }
+
+    #expect(pinning.asked.isEmpty)
+    #expect(connection.parameters.requiredInterface == nil)
+    #expect(!ListedInterfacePinning.isMarked(connection.parameters))
+}
+
+/// The thrown `WiFiConnectFailure`, or nil if the connect unexpectedly succeeded.
+///
+/// The timeout is short because nothing here depends on it: a refused connect to
+/// `deadEndpoint` surfaces as `.waiting(Connection refused)` rather than `.failed`,
+/// so the connect ends on its own bound — and every field these tests read (the
+/// pinned interface, the pin statement) is the same whichever way it ends.
+private func connectFailure(
+    to endpoint: NWEndpoint, pin: WiFiPathPin, interfaces: ListedInterfacePinning
+) async -> WiFiConnectFailure? {
+    do {
+        let unexpected = try await TCPFetch.connect(to: endpoint, timeout: .milliseconds(50),
+                                                    pin: pin, interfaces: interfaces)
+        unexpected.cancel()
+        Issue.record("the connect to a closed port succeeded")
+        return nil
+    } catch let thrown as WiFiConnectFailure {
+        return thrown
+    } catch {
+        Issue.record("unexpected error: \(error)")
+        return nil
+    }
+}
+
+// MARK: - …and the last mile, which needs a real NWInterface
+//
+// Both of these skip — explicitly, never faked green — on a host whose
+// `NWPathMonitor` lists no interface. They are not what holds the pin; the three
+// hermetic checks above are. What they add is the one thing no fake can say:
+// that this SDK really enforces `requiredInterface` on a socket.
+
+/// The single statement no test can reach with a synthetic value:
+/// `parameters.requiredInterface = interface`, in `SystemInterfacePinning`.
+///
+/// Passive — `NWPathMonitor` reads the system's own path state and sends nothing.
+@Test(requiresAListedInterface)
+func theSystemPinnerRequiresAnInterfaceTheFrameworkLists() async throws {
+    let listed = await HostInterfaces.availableInterfaces(within: .milliseconds(500))
+    let interface = try #require(listed.first, "the probe said this host lists one")
+    let parameters = NWParameters.tcp
+
+    let required = await SystemInterfacePinning().requireInterface(
+        named: interface.name, of: parameters, within: .milliseconds(500))
+
+    #expect(required == interface.name)
+    #expect(parameters.requiredInterface == interface)
+
+    // A name the framework does not list requires nothing and leaves the
+    // parameters alone — the fallback every loopback transfer here takes.
+    let untouched = NWParameters.tcp
+    let none = await SystemInterfacePinning().requireInterface(
+        named: "pocket-nonexistent0", of: untouched, within: .milliseconds(200))
+    #expect(none == nil)
+    #expect(untouched.requiredInterface == nil)
+}
+
+/// **The pin's effect on a real socket.** Requiring an interface that cannot carry
+/// loopback traffic must make a connect to a live loopback listener fail, while
+/// the identical connect with nothing required succeeds — a causal pair, because
+/// only a connection that really was constrained can fail against a listener that
+/// is demonstrably up. Measured behaviour, not a guess: requiring `en0` of a
+/// loopback destination sits in `.waiting(POSIXErrorCode 50: Network is down)`.
+@Test(requiresANonLoopbackListedInterface)
+func theConnectAppliesThePinToTheSocketItOpens() async throws {
+    let server = try LoopbackServer(payload: Data([0xFF, 0xF3]))
+    defer { server.stop() }
+
+    // None of the listed interfaces is loopback — that is the whole reason the
+    // loopback tests go unpinned — so none can carry a connection to 127.0.0.1.
+    let listed = await HostInterfaces.availableInterfaces(within: .milliseconds(500))
+    let carrier = try #require(listed.first { $0.type != .loopback },
+                               "the probe said this host lists one")
+
     let pin = WiFiPathPin.choose(
         reaching: server.endpoint,
         among: [HostInterfaceAddress(interfaceName: carrier.name, address: "127.0.0.1")])
@@ -1208,9 +1360,14 @@ func hostHoldingLinks(
 // regression there would be worse than the bug being fixed, so it gets tests that
 // go red if it is removed.
 
-/// Readiness that resolves inside a test run and makes the two budgets — the
-/// short one for a host that is simply elsewhere, the full one for a join still
-/// being refused a lease — far enough apart to tell apart.
+/// Readiness that makes the two budgets — the short one for a host that is simply
+/// elsewhere, the full one for a join still being refused a lease — far enough
+/// apart to tell apart.
+///
+/// Nothing here has to "resolve inside a test run" any more: these tests hand the
+/// pre-flight a `VirtualClock`, so the budgets are spent in virtual time and
+/// nothing sleeps. The numbers are kept small anyway, so a reader comparing them
+/// against `hostAddressWait`'s real 3 s default sees the same shape.
 private let preFlightReadiness = WiFiReadiness(timeout: .milliseconds(500),
                                                pollInterval: .milliseconds(5),
                                                pingInterval: .seconds(60),
@@ -1219,35 +1376,55 @@ private let preFlightReadiness = WiFiReadiness(timeout: .milliseconds(500),
 /// The grace window itself: an address that shows up a few looks late — DHCP
 /// completing after `NEHotspotConfiguration.apply` has already returned — is
 /// waited for, not refused.
+///
+/// This used to be a race it was quietly losing. The pre-flight really slept 5 ms
+/// between looks against a 50 ms budget, so on a runner where a 5 ms sleep takes
+/// 25 ms the budget expired before the third look and the test failed with
+/// `held: []` — the address never "arrived" at all. Virtual time removes the race:
+/// three looks cost exactly two steps, whatever the machine is doing.
 @Test func thePreFlightWaitsForAnAddressThatArrivesLate() async {
     let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
     let leased = HostInterfaceAddress(interfaceName: "en0", address: "127.0.0.1")
     let looks = Counter()
     await session.setHostInterfaces { looks.next() < 3 ? [] : [leased] }
+    let clock = VirtualClock()
 
-    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness)
+    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness,
+                                               clock: clock)
 
     #expect(pin == .interface(leased, deviceSubnet: "127.0.0", alsoOnSubnet: []))
+    // The first look is free and each later one costs a poll interval, so the
+    // third lands at two steps — well inside the 50 ms short budget, which is the
+    // point: the address was waited for, not waited out.
+    #expect(clock.elapsed == preFlightReadiness.pollInterval * 2)
+    #expect(clock.elapsed < preFlightReadiness.hostAddressWait)
     await session.stop()
 }
 
 /// And the other side of it: a host that is simply not on the network is answered
 /// in `hostAddressWait`, not made to sit out the whole connect budget. The 30 s
 /// timeout this replaced is the behaviour being removed.
+///
+/// An equality, not a generous inequality. The old form measured the wall clock
+/// around a call that really slept and asserted `< 250 ms` against a 50 ms budget;
+/// a loaded GitHub runner measured 353 ms and the test went red while the code was
+/// correct. What the pre-flight promises is the *budget*, so the budget is what is
+/// checked — exactly, and without sleeping.
 @Test func thePreFlightGivesUpQuicklyOnAHostThatIsSimplyElsewhere() async {
     let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
     await session.setHostInterfaces(hostHolding(("en1", "10.0.1.23")))
+    let clock = VirtualClock()
 
-    let clock = ContinuousClock()
-    let began = clock.now
-    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness)
-    let elapsed = clock.now - began
+    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness,
+                                               clock: clock)
 
     #expect(pin == .hostNotOnTheDeviceSubnet(
         deviceSubnet: "127.0.0",
         held: [HostInterfaceAddress(interfaceName: "en1", address: "10.0.1.23")]))
-    // Comfortably inside the 500 ms connect budget: the short answer was taken.
-    #expect(elapsed < .milliseconds(250))
+    // The short answer, to the microsecond — and a small fraction of the 500 ms
+    // connect budget this sits in front of.
+    #expect(clock.elapsed == preFlightReadiness.hostAddressWait)
+    #expect(clock.elapsed < preFlightReadiness.timeout)
     await session.stop()
 }
 
@@ -1259,19 +1436,37 @@ private let preFlightReadiness = WiFiReadiness(timeout: .milliseconds(500),
 @Test func thePreFlightKeepsWaitingWhileDHCPIsStillBeingRefused() async {
     let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
     await session.setHostInterfaces(hostHolding(("en0", "169.254.12.34")))
+    let clock = VirtualClock()
 
-    let clock = ContinuousClock()
-    let began = clock.now
-    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness)
-    let elapsed = clock.now - began
+    let pin = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness,
+                                               clock: clock)
 
     #expect(pin == .hostNotOnTheDeviceSubnet(
         deviceSubnet: "127.0.0",
         held: [HostInterfaceAddress(interfaceName: "en0", address: "169.254.12.34")]))
-    // Well past the 50 ms short budget — it held on for the full 500 ms one.
-    #expect(elapsed > .milliseconds(250))
-    #expect(elapsed < .seconds(2))
+    // The full connect budget, not the 50 ms short one — and never a microsecond
+    // past it, which is what makes this cheaper than the connect it replaced
+    // rather than an extra wait bolted in front of it.
+    #expect(clock.elapsed == preFlightReadiness.timeout)
+    #expect(clock.elapsed > preFlightReadiness.hostAddressWait)
     await session.stop()
+}
+
+/// The two budgets are the *same* code path told apart by one piece of evidence,
+/// so they are also stated against each other: nothing but the self-assigned
+/// address distinguishes these two hosts, and it is worth an order of magnitude.
+@Test func theSelfAssignedAddressIsWhatBuysTheLongerBudget() async {
+    func budgetSpent(holding address: String) async -> Duration {
+        let session = PocketSession(transport: FakeTransport(), sessionKey: "K")
+        await session.setHostInterfaces(hostHolding(("en0", address)))
+        let clock = VirtualClock()
+        _ = await session.resolveWiFiPathPin(to: deadEndpoint, readiness: preFlightReadiness,
+                                             clock: clock)
+        await session.stop()
+        return clock.elapsed
+    }
+    #expect(await budgetSpent(holding: "169.254.12.34") == preFlightReadiness.timeout)
+    #expect(await budgetSpent(holding: "10.0.1.23") == preFlightReadiness.hostAddressWait)
 }
 
 /// A host in that state is joined — the password was accepted — and unleased. The
@@ -1307,16 +1502,20 @@ private let preFlightReadiness = WiFiReadiness(timeout: .milliseconds(500),
 }
 
 /// Network.framework's own interface list is the only source of `NWInterface`
-/// values, and a name it does not list must resolve to nil promptly rather than
-/// holding the connect up — the fallback every loopback test here takes, since
-/// loopback is legitimately absent from that list.
+/// values, and a name it does not list must resolve to nil rather than holding the
+/// connect up — the fallback every loopback test here takes, since loopback is
+/// legitimately absent from that list.
+///
+/// Environment-*independent*, unlike the pin checks above: no host lists an
+/// interface under this name, so nil is the answer on a machine listing a dozen
+/// and on one listing none. The bound is a `VirtualClock`'s, so the promptness is
+/// exact rather than a generous inequality against the wall clock.
 @Test func anInterfaceNetworkFrameworkDoesNotListResolvesToNilPromptly() async {
-    let clock = ContinuousClock()
-    let began = clock.now
+    let clock = VirtualClock()
     let resolved = await HostInterfaces.availableInterface(named: "pocket-nonexistent0",
-                                                          within: .milliseconds(200))
+                                                           within: .milliseconds(200), on: clock)
     #expect(resolved == nil)
-    #expect(clock.now - began < .seconds(2))
+    #expect(clock.elapsed <= .milliseconds(200))
 }
 
 /// The iOS shape, which works today and must not regress: the process joined the

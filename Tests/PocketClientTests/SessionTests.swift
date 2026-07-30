@@ -219,7 +219,14 @@ private final class TickCounter: @unchecked Sendable {
 /// continuation is never resumed by cancellation alone, and one left pending
 /// wedges `perform`'s task group forever — the caller hangs past every
 /// timeout and the occupied slot fails all later requests with `.busy`.
-@Test func cancellingAnArmedRequestReturnsPromptlyAndFreesTheSlot() async throws {
+///
+/// The request's own timeout is put ten minutes out of reach so that the promptness
+/// is proved by what happens rather than measured on the wall clock: a waiter that
+/// only unwinds when its timeout expires cannot finish inside this test's
+/// one-minute limit. The stopwatch this used to carry — under a second, against a
+/// 30 s timeout — measured the machine as much as the code.
+@Test(.timeLimit(.minutes(1)))
+func cancellingAnArmedRequestReturnsPromptlyAndFreesTheSlot() async throws {
     let t = FakeTransport()
     t.script["APP&SK&K"] = ["MCU&SK&OK"]
     t.script["APP&BAT"] = ["MCU&BAT&64"]
@@ -231,18 +238,15 @@ private final class TickCounter: @unchecked Sendable {
     t.onSend = { wire, _ in if wire == "APP&STE" { armedContinuation.yield(()) } }
 
     let request = Task {
-        try await session.request(.recordingState, timeout: .seconds(30)) {
+        try await session.request(.recordingState, timeout: .seconds(600)) {
             if case .recordingState = $0 { true } else { false }
         }
     }
     var armedEvents = armed.makeAsyncIterator()
     _ = await armedEvents.next()   // the waiter is installed before the frame hits the wire
 
-    let clock = ContinuousClock()
-    let began = clock.now
     request.cancel()
     await #expect(throws: CancellationError.self) { _ = try await request.value }
-    #expect(clock.now - began < .seconds(1))   // prompt — nowhere near the 30 s timeout
 
     // The slot is free again: the next request answers instead of `.busy`.
     let response = try await session.request(.battery) {

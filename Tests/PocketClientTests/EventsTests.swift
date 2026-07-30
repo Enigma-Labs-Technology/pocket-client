@@ -83,7 +83,10 @@ import Testing
 /// a consumer iterating `for await` (that never calls `disconnect()` itself)
 /// has to see the final event and then terminate, instead of blocking
 /// forever on a stream nobody will ever feed again.
-@Test func linkLossFinishesTheEventsStreamAfterDeliveringDisconnected() async throws {
+/// The test's time limit is what holds "terminate": a stopwatch read after the
+/// await could never fire, because an await that never returns never reaches it.
+@Test(.timeLimit(.minutes(1)))
+func linkLossFinishesTheEventsStreamAfterDeliveringDisconnected() async throws {
     let t = FakeTransport()
     t.script["APP&SK&K"] = ["MCU&SK&OK"]
     let session = PocketSession(transport: t, sessionKey: "K")
@@ -95,13 +98,10 @@ import Testing
         return seen
     }
 
-    let clock = ContinuousClock()
-    let began = clock.now
     t.emitResponse("MCU&WIFIS&0")   // one genuine event before the drop
     t.finish()                      // then the BLE link dies
 
     let events = await consumer.value   // must terminate, not block forever
-    #expect(clock.now - began < .seconds(1))
     #expect(events == [.unmatchedResponse("MCU&WIFIS&0"), .disconnected])
     await session.stop()
 }
@@ -303,7 +303,10 @@ private let recording = RecordingInfo(
 /// `stop()` must finish an active live stream — a consumer blocked in
 /// `for await` ends promptly instead of hanging — and must not leave the
 /// dead stream's slot claimed.
-@Test func stopFinishesLiveStreamAndReleasesTheSlot() async throws {
+/// "Ends promptly" is held by the test's time limit rather than a stopwatch: a
+/// consumer that hangs never reaches a line that reads one.
+@Test(.timeLimit(.minutes(1)))
+func stopFinishesLiveStreamAndReleasesTheSlot() async throws {
     let t = FakeTransport()
     t.script["APP&SK&K"] = ["MCU&SK&OK"]
     let session = PocketSession(transport: t, sessionKey: "K")
@@ -312,11 +315,8 @@ private let recording = RecordingInfo(
     let stream = try await session.liveAudio()
     let consumer = Task { for await _ in stream { } }
 
-    let clock = ContinuousClock()
-    let began = clock.now
     await session.stop()
     _ = await consumer.value   // must complete, not hang on the dead link
-    #expect(clock.now - began < .seconds(1))   // well under any timeout
 
     // Post-stop callers are told the session is over, not handed a dead stream.
     await #expect(throws: PocketError.notAuthenticated) {
@@ -331,7 +331,8 @@ private let recording = RecordingInfo(
 /// Link loss (both transport streams end, the `handleDisconnect` path) gives
 /// the same guarantee: the consumer's loop terminates promptly and the slot
 /// is released rather than left claimed by the dead stream.
-@Test func linkLossFinishesLiveStreamAndReleasesTheSlot() async throws {
+@Test(.timeLimit(.minutes(1)))
+func linkLossFinishesLiveStreamAndReleasesTheSlot() async throws {
     let t = FakeTransport()
     t.script["APP&SK&K"] = ["MCU&SK&OK"]
     let session = PocketSession(transport: t, sessionKey: "K")
@@ -340,11 +341,8 @@ private let recording = RecordingInfo(
     let stream = try await session.liveAudio()
     let consumer = Task { for await _ in stream { } }
 
-    let clock = ContinuousClock()
-    let began = clock.now
     t.finish()   // BLE link drops: both characteristic streams end
     _ = await consumer.value   // must complete, not hang on the dead link
-    #expect(clock.now - began < .seconds(1))   // well under any timeout
 
     // notAuthenticated, not .busy: the disconnect tore the session down.
     await #expect(throws: PocketError.notAuthenticated) {

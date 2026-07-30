@@ -164,7 +164,17 @@ private let recording = RecordingInfo(
     await session.stop()
 }
 
-@Test func cancellationFinishesPromptlyAndReleasesTheSession() async throws {
+/// Cancellation ends the download *itself*, rather than the idle timeout ending
+/// it a few seconds later and cancellation merely being what was in the air.
+///
+/// Proved causally rather than by the stopwatch. This used to read the wall clock
+/// and assert the cancel took under a second against a 5 s idle timeout — a
+/// measurement of how loaded the machine is as much as of the code. Instead the
+/// idle timeout is put ten minutes out of reach: a download that only notices
+/// cancellation when it expires cannot finish inside the test's own one-minute
+/// limit, so the distinction is made by what happens rather than by how fast.
+@Test(.timeLimit(.minutes(1)))
+func cancellationFinishesPromptlyAndReleasesTheSession() async throws {
     let golden = try FakeTransport.loadGoldenFixture()
     let t = FakeTransport()
     t.script["APP&SK&K"] = ["MCU&SK&OK"]
@@ -178,21 +188,20 @@ private let recording = RecordingInfo(
     let session = PocketSession(transport: t, sessionKey: "K")
     try await session.start()
 
-    let download = Task { try await session.downloadOverBLE(recording) }
+    // Ten minutes: far past anything this test can wait for, so an idle expiry
+    // cannot be what ends the download below.
+    let download = Task { try await session.downloadOverBLE(recording,
+                                                            idleTimeout: .seconds(600)) }
     var gate = transferring.makeAsyncIterator()
     _ = await gate.next()
     // Give the size response time to unwind so the chunk has landed and the
     // download is inside its transfer phase, not the request phase.
     try await Task.sleep(for: .milliseconds(100))
 
-    let clock = ContinuousClock()
-    let cancelled = clock.now
     download.cancel()
     await #expect(throws: CancellationError.self) {
         _ = try await download.value
     }
-    // Well under the 5s idle timeout: cancellation, not idle expiry.
-    #expect(clock.now - cancelled < .seconds(1))
 
     // Sink and transfer slot were released: a fresh download succeeds.
     t.onSend = { wire, transport in

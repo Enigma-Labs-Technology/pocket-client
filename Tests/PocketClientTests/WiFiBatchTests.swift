@@ -1174,7 +1174,12 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
 
 /// Cancelling mid-batch is the caller's, not a WiFi failure: it surfaces as
 /// `CancellationError` and still closes the access point.
-@Test func cancellingMidBatchClosesTheAccessPointAndLeavesNoFile() async throws {
+///
+/// The stall timeout is put ten minutes out of reach so cancellation is proved by
+/// what happens rather than measured on the wall clock: a batch that only unwinds
+/// when the stall expires cannot finish inside this test's one-minute limit.
+@Test(.timeLimit(.minutes(1)))
+func cancellingMidBatchClosesTheAccessPointAndLeavesNoFile() async throws {
     let golden = try FakeTransport.loadGoldenFixture()
     let reachedSecond = AsyncGate()
     let never = AsyncGate()
@@ -1201,16 +1206,13 @@ private let batchBriefReadiness = WiFiReadiness(timeout: .milliseconds(100),
             into: .files { dir.appendingPathComponent("\($0.id.timestamp).mp3") },
             endpointOverride: server.endpoint,
             joiner: joiner,
+            idleTimeout: .seconds(600),   // far out of reach: only a cancel can end this
             readiness: fastReadiness)
     }
     await reachedSecond.wait()
 
-    let clock = ContinuousClock()
-    let cancelled = clock.now
     batch.cancel()
     await #expect(throws: CancellationError.self) { _ = try await batch.value }
-    // Well under the 10 s stall timeout: cancellation, not idle expiry.
-    #expect(clock.now - cancelled < .seconds(2))
 
     // Recording 1 is on disk and validated; recording 2 left nothing at all,
     // not even its temp companion.

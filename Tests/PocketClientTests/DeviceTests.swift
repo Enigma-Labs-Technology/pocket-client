@@ -48,7 +48,8 @@ import Testing
 /// A failed `connect()` must tear the session down, not just mark the façade
 /// closed: the transport link is dropped and `events` finishes, so nobody
 /// hangs iterating events of a device that never came up. (Task 8 review.)
-@Test func failedConnectTearsDownSessionAndFinishesEvents() async throws {
+@Test(.timeLimit(.minutes(1)))
+func failedConnectTearsDownSessionAndFinishesEvents() async throws {
     let t = FakeTransport()
     t.script["APP&SK&BAD"] = ["MCU&SK&ERR"]
     let device = PocketDevice(transport: t, sessionKey: "BAD")
@@ -56,10 +57,10 @@ import Testing
     await #expect(throws: PocketError.authRejected) { try await device.connect() }
 
     #expect(t.didDisconnect)
-    let clock = ContinuousClock()
-    let began = clock.now
-    for await _ in device.events { }   // must complete promptly, not hang
-    #expect(clock.now - began < .seconds(1))
+    // Must complete, not hang. The test's time limit is what says so: a stopwatch
+    // after this loop could never fire, because a loop that never ends never
+    // reaches the line that reads it.
+    for await _ in device.events { }
 
     // The instance is spent, exactly like after a disconnect().
     await #expect(throws: PocketError.disconnected) { try await device.connect() }

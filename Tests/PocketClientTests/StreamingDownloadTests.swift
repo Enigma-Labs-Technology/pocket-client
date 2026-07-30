@@ -143,7 +143,12 @@ private func scriptedBLESession(serving payload: Data,
     await session.stop()
 }
 
-@Test func streamingCancellationLeavesNoFileAndReleasesTheSlot() async throws {
+/// As `cancellationFinishesPromptlyAndReleasesTheSession`, and causal for the same
+/// reason: the idle timeout is put ten minutes out of reach, so only cancellation
+/// itself can end the download inside this test's one-minute limit. No stopwatch,
+/// and so nothing here a loaded runner can turn red.
+@Test(.timeLimit(.minutes(1)))
+func streamingCancellationLeavesNoFileAndReleasesTheSlot() async throws {
     let golden = try FakeTransport.loadGoldenFixture()
     let dir = try makeScratchDirectory()
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -161,21 +166,18 @@ private func scriptedBLESession(serving payload: Data,
     let session = PocketSession(transport: t, sessionKey: "K")
     try await session.start()
 
-    let download = Task { try await session.downloadOverBLE(recording, to: destination) }
+    let download = Task { try await session.downloadOverBLE(recording, to: destination,
+                                                            idleTimeout: .seconds(600)) }
     var gate = transferring.makeAsyncIterator()
     _ = await gate.next()
     // Give the size response time to unwind so the chunk has landed and the
     // download is inside its transfer phase, not the request phase.
     try await Task.sleep(for: .milliseconds(100))
 
-    let clock = ContinuousClock()
-    let cancelled = clock.now
     download.cancel()
     await #expect(throws: CancellationError.self) {
         try await download.value
     }
-    // Well under the 5 s idle timeout: cancellation, not idle expiry.
-    #expect(clock.now - cancelled < .seconds(1))
     // The partial temp file did not survive the cancellation.
     #expect(try contents(of: dir).isEmpty)
 

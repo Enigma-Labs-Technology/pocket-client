@@ -226,6 +226,28 @@ notes for a release before upgrading.
   the credential guidance. Message text only: no new error case, no control-flow or
   teardown change, and no credential in any of it.
 
+- **The tests holding the Wi-Fi interface pin and the pre-flight no longer fail on
+  CI.** Three of them broke the suite's own hermeticity rule and went red on every
+  GitHub run while passing on a developer's Mac, which meant the mutation guarantee
+  those two fixes rest on did not hold in the environment that gates merges. Two
+  causes. They asked the machine for a real `NWInterface` — a type with no public
+  initializer, so the only source is a live `NWPath`, and a virtualised runner's
+  `NWPathMonitor` lists none at all, so `try #require(listed.first)` failed there by
+  construction. And they measured budgets on the wall clock: a 250 ms bound around
+  calls that really slept measured 353 ms on a loaded runner.
+
+  Both now have seams. `WiFiInterfacePinning` resolves and applies the pin by
+  interface *name* — which is what `HostInterfaceAddress.interfaceName` already is —
+  so the pin's whole decision is tested against a written-down list, including that
+  the parameters it constrains are the object the socket is opened with. The Wi-Fi
+  pre-flight and the bounded `NWPathMonitor` poll take a `Clock`, so their budgets
+  are checked exactly, in virtual time, without sleeping. The two checks that
+  genuinely need a real `NWInterface` — that this SDK enforces `requiredInterface`
+  on a socket — remain, and now *skip* with an explicit message on a host that lists
+  none, the way the Keychain round-trips already skip on an unsigned test runner.
+  Behaviour is unchanged: production passes a `ContinuousClock` and
+  Network.framework's own interface list, exactly as before.
+
 ### Added
 
 - **`ManualHotspotJoiner` warns about Ethernet before the join prompt.** With a

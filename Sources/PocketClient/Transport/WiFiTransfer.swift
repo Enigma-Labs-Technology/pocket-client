@@ -677,16 +677,22 @@ enum HostInterfaces {
     ///
     /// Loopback is legitimately absent from that list, so a nil here is ordinary
     /// and means "leave the connection unpinned" — the behaviour that shipped.
-    static func availableInterface(named name: String, within bound: Duration) async -> NWInterface? {
-        await availableInterfaces(within: bound).first { $0.name == name }
+    static func availableInterface<C: Clock>(
+        named name: String, within bound: Duration, on clock: C = ContinuousClock()
+    ) async -> NWInterface? where C.Duration == Duration {
+        await availableInterfaces(within: bound, on: clock).first { $0.name == name }
     }
 
     /// Every `NWInterface` Network.framework currently considers available.
     ///
     /// A monitor that never reports yields an empty list, which leaves the
-    /// connection unpinned rather than holding a transfer up.
-    static func availableInterfaces(within bound: Duration) async -> [NWInterface] {
-        await firstReportedPath(within: bound)?.interfaces ?? []
+    /// connection unpinned rather than holding a transfer up. **A host that lists
+    /// none at all is ordinary, not broken** — a virtualised CI runner is one —
+    /// so nothing in this package may treat an empty list as a fault.
+    static func availableInterfaces<C: Clock>(
+        within bound: Duration, on clock: C = ContinuousClock()
+    ) async -> [NWInterface] where C.Duration == Duration {
+        await firstReportedPath(within: bound, on: clock)?.interfaces ?? []
     }
 
     /// Whether this host's **default** path — the one an unconstrained
@@ -704,11 +710,38 @@ enum HostInterfaces {
     ///
     /// `false` on a monitor that never reports: a warning that cannot be
     /// substantiated is not printed, and nothing here gates a transfer on it.
-    static func defaultPathIsWired(
-        within bound: Duration = WiFiReadiness.maximumInterfaceSnapshotWait
-    ) async -> Bool {
-        guard let path = await firstReportedPath(within: bound) else { return false }
+    static func defaultPathIsWired<C: Clock>(
+        within bound: Duration = WiFiReadiness.maximumInterfaceSnapshotWait,
+        on clock: C = ContinuousClock()
+    ) async -> Bool where C.Duration == Duration {
+        guard let path = await firstReportedPath(within: bound, on: clock) else { return false }
         return path.isSatisfiedOverWiredEthernet
+    }
+
+    /// Polls `read` until it answers, giving up after `bound` — the bounded wait
+    /// every `NWPathMonitor` read here sits behind.
+    ///
+    /// Named, and taking its clock, for one reason: what it guarantees is a
+    /// *duration* — that a monitor with nothing to say can never hold a transfer
+    /// up — and a test of that guarantee which reads the wall clock is really a
+    /// test of how loaded the machine running it happens to be. With the clock
+    /// injected the guarantee is checked exactly (see
+    /// `theBoundedPollGivesUpAtItsBoundWithoutSleepingOnTheWallClock`); production
+    /// passes a `ContinuousClock` and behaves as it always did.
+    ///
+    /// `read` is consulted once more after the deadline so a value that landed
+    /// during the final sleep is not thrown away.
+    static func poll<T, C: Clock>(within bound: Duration, on clock: C,
+                                  step: Duration = .milliseconds(5),
+                                  read: () -> T?) async -> T? where C.Duration == Duration {
+        let step = min(step, bound)
+        let deadline = clock.now.advanced(by: bound)
+        while clock.now < deadline {
+            if let answer = read() { return answer }
+            if Task.isCancelled { break }
+            try? await clock.sleep(for: step)
+        }
+        return read()
     }
 
     /// What one `NWPath` report says, reduced to the two facts this package
@@ -725,7 +758,9 @@ enum HostInterfaces {
     /// `NWPathMonitor` is the only public source of these values — `NWInterface`
     /// has no public initializer — and it reports asynchronously, hence the
     /// bounded poll for its first report.
-    private static func firstReportedPath(within bound: Duration) async -> PathFacts? {
+    private static func firstReportedPath<C: Clock>(
+        within bound: Duration, on clock: C
+    ) async -> PathFacts? where C.Duration == Duration {
         let snapshot = PathSnapshot()
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { path in
@@ -736,14 +771,7 @@ enum HostInterfaces {
         }
         monitor.start(queue: .global())
         defer { monitor.cancel() }
-        let step = min(.milliseconds(5), bound)
-        let deadline = ContinuousClock.now + bound
-        while ContinuousClock.now < deadline {
-            if let facts = snapshot.value { return facts }
-            if Task.isCancelled { break }
-            try? await Task.sleep(for: step)
-        }
-        return snapshot.value
+        return await poll(within: bound, on: clock) { snapshot.value }
     }
 
     /// The monitor reports on its own queue; the poll above reads from the
@@ -887,40 +915,28 @@ enum WiFiPathPin: Sendable, Equatable {
         if case .interface(let held, _, _) = self { held.interfaceName } else { nil }
     }
 
-    /// TCP parameters for a connection that must use `interface`.
+    /// The parameters a connection carrying this pin starts from: a plain
+    /// `NWParameters.tcp`, and deliberately nothing else. `WiFiInterfacePinning`
+    /// is what then requires an interface of them, or does not.
     ///
-    /// `requiredInterface` is the pin, and **not** `requiredLocalEndpoint`.
-    /// Measured on this SDK: a connection required to use `en0` while its
-    /// destination is reachable only over loopback sits in
-    /// `.waiting(POSIXErrorCode 50: Network is down)` rather than quietly going
-    /// elsewhere, so `requiredInterface` is enforced — while
-    /// `requiredLocalEndpoint` was ignored outright, including when the address
-    /// it named belonged to no interface on the machine. Pinning with a
-    /// mechanism the framework ignores would be another unverified guess, which
-    /// is the thing this change exists to stop making.
+    /// **Nothing else is set here, and an earlier version's
+    /// `prohibitedInterfaceTypes` was removed rather than corrected.** It derived
+    /// the prohibited set from the chosen interface's *name* (`en*`/`lo*` ⇒
+    /// exclude `.other`, the class a mesh VPN's `utun` reports as), which is an
+    /// inference stacked on a `requiredInterface` that already excludes every
+    /// other interface outright — so it bought nothing where the pin applied, and
+    /// where the pin did *not* apply it could prohibit the very interface the
+    /// connection needed. That failure would arrive as a silent `.waiting`:
+    /// indistinguishable from the defect being fixed, and it would be met by
+    /// guidance confidently blaming a VPN for owning the default route. Producing
+    /// exactly the misattribution this change exists to end is not a price worth
+    /// paying for a redundancy.
     ///
-    /// **Nothing else is set, and an earlier version's `prohibitedInterfaceTypes`
-    /// was removed rather than corrected.** It derived the prohibited set from
-    /// the chosen interface's *name* (`en*`/`lo*` ⇒ exclude `.other`, the class a
-    /// mesh VPN's `utun` reports as), which is an inference stacked on a
-    /// `requiredInterface` that already excludes every other interface outright —
-    /// so it bought nothing where the pin applied, and where the pin did *not*
-    /// apply it could prohibit the very interface the connection needed. That
-    /// failure would arrive as a silent `.waiting`: indistinguishable from the
-    /// defect being fixed, and it would be met by guidance confidently blaming a
-    /// VPN for owning the default route. Producing exactly the misattribution
-    /// this change exists to end is not a price worth paying for a redundancy.
-    ///
-    /// `interface` is nil when Network.framework does not list the chosen
-    /// interface among the ones it considers available; the connection is then
-    /// left unpinned — byte for byte the previous behaviour, a plain
-    /// `NWParameters.tcp` — and the failure message says so rather than implying
-    /// a pin that was never applied.
-    func tcpParameters(requiring interface: NWInterface?) -> NWParameters {
-        let parameters = NWParameters.tcp
-        if let interface { parameters.requiredInterface = interface }
-        return parameters
-    }
+    /// So when Network.framework does not list the chosen interface among the ones
+    /// it considers available, the connection stays exactly as this leaves it —
+    /// byte for byte the previous behaviour — and the failure message says so
+    /// rather than implying a pin that was never applied.
+    var tcpParameters: NWParameters { .tcp }
 
     /// One line for the event stream, before the attempt: what this host looks
     /// like and what the connect is therefore going to do.
@@ -958,6 +974,62 @@ enum WiFiPathPin: Sendable, Equatable {
             let shown = prefix == deviceSubnet ? held.address : "\(prefix ?? held.address).x"
             return "\(held.interfaceName) \(shown)"
         }.joined(separator: ", ")
+    }
+}
+
+/// Requires an interface of a connection's parameters, by name — and answers
+/// which name it actually required.
+///
+/// **The seam the interface pin is tested through, and it has to sit at exactly
+/// this level.** `NWInterface` has no public initializer: only a live `NWPath`
+/// can produce one, so no test can hand one over, and a test that asks the real
+/// machine for one is a test that fails on every machine listing none — a
+/// virtualised CI runner is one, and that is not a defect in this package. What a
+/// test *can* hand over is what the rest of this file already reasons in: an
+/// interface **name**, which is what `HostInterfaceAddress.interfaceName` is.
+///
+/// So the whole of the pin's decision — whether to require anything, which name,
+/// what is reported when the framework does not list it, and that the parameters
+/// constrained here are the ones the socket is opened with — sits on this side of
+/// the seam, where hermetic tests hold it. The one statement no test can reach,
+/// `parameters.requiredInterface = interface`, sits on the other side in
+/// `SystemInterfacePinning`, and only the SDK's enforcement of it is left to an
+/// environment-dependent check.
+protocol WiFiInterfacePinning: Sendable {
+    /// Requires the interface named `name` of `parameters`, if Network.framework
+    /// lists one under that name within `bound`.
+    ///
+    /// Answers the name actually required, or nil when nothing was — which leaves
+    /// the connection unpinned, byte for byte the behaviour that shipped, and is
+    /// the ordinary outcome for loopback (legitimately absent from that list).
+    func requireInterface(named name: String, of parameters: NWParameters,
+                          within bound: Duration) async -> String?
+}
+
+/// The real one: Network.framework's own list of available interfaces.
+///
+/// `requiredInterface` is the pin, and **not** `requiredLocalEndpoint`. Measured
+/// on this SDK: a connection required to use `en0` while its destination is
+/// reachable only over loopback sits in
+/// `.waiting(POSIXErrorCode 50: Network is down)` rather than quietly going
+/// elsewhere, so `requiredInterface` is enforced — while `requiredLocalEndpoint`
+/// was ignored outright, including when the address it named belonged to no
+/// interface on the machine. Pinning with a mechanism the framework ignores would
+/// be another unverified guess, which is the thing this change exists to stop
+/// making. That measurement is what
+/// `theConnectAppliesThePinToTheSocketItOpens` re-checks wherever a host lists an
+/// interface to check it with.
+struct SystemInterfacePinning: WiFiInterfacePinning {
+    func requireInterface(named name: String, of parameters: NWParameters,
+                          within bound: Duration) async -> String? {
+        guard let interface = await HostInterfaces.availableInterface(named: name, within: bound)
+        else { return nil }
+        parameters.requiredInterface = interface
+        // Read back off the parameters rather than returned from the value that
+        // was assigned: what a failure reports as pinned is then what the socket
+        // actually carries, so "pinned and still failed" can never be said of a
+        // connection that was not.
+        return parameters.requiredInterface?.name
     }
 }
 
@@ -1169,9 +1241,16 @@ enum TCPFetch {
     /// `PocketSession.resolveWiFiPathPin`. A pin that says this host holds no
     /// address on the device's subnet is a connect that cannot succeed, and it
     /// fails here and now rather than spending the whole timeout discovering it.
-    static func connect(to endpoint: Network.NWEndpoint,
-                        timeout: Duration = .seconds(30),
-                        pin: WiFiPathPin = .noSubnetToCompare) async throws -> NWConnection {
+    ///
+    /// `interfaces` is how the pin reaches Network.framework; the default is the
+    /// framework itself. See `WiFiInterfacePinning` for why the seam is there and
+    /// why it cannot be anywhere lower.
+    static func connect<Pinning: WiFiInterfacePinning>(
+        to endpoint: Network.NWEndpoint,
+        timeout: Duration = .seconds(30),
+        pin: WiFiPathPin = .noSubnetToCompare,
+        interfaces: Pinning = SystemInterfacePinning()
+    ) async throws -> NWConnection {
         let watcher = WiFiConnectWatcher()
         // The pre-flight. Nothing on the device's subnet means this host is not
         // on the access point, and the useful answer is "join it", now, naming
@@ -1179,15 +1258,19 @@ enum TCPFetch {
         if case .hostNotOnTheDeviceSubnet = pin {
             throw watcher.failure("wifi tcp connect not attempted", pin: pin, pinnedInterface: nil)
         }
-        let required: NWInterface?
+        // Built once and constrained in place, so the parameters the pin is
+        // applied to are the very object the socket is opened with — not a copy
+        // taken afterwards, which is a pin that quietly reaches nothing.
+        let parameters = pin.tcpParameters
+        let pinnedInterface: String?
         if let name = pin.interfaceName {
-            required = await HostInterfaces.availableInterface(
-                named: name, within: WiFiReadiness.maximumInterfaceSnapshotWait)
+            pinnedInterface = await interfaces.requireInterface(
+                named: name, of: parameters,
+                within: WiFiReadiness.maximumInterfaceSnapshotWait)
         } else {
-            required = nil
+            pinnedInterface = nil
         }
-        let pinnedInterface = required?.name
-        let connection = NWConnection(to: endpoint, using: pin.tcpParameters(requiring: required))
+        let connection = NWConnection(to: endpoint, using: parameters)
         return try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1826,13 +1909,28 @@ extension PocketSession {
     /// is `readiness.timeout` either way, so this can never wait longer than the
     /// connect it replaces would have, and it ends in a diagnosis rather than a
     /// bare timeout however long it takes.
+    ///
+    /// `clock` is a seam, and the budgets above are why it has to be one. What
+    /// this function guarantees is a *duration* — a host that is simply elsewhere
+    /// is answered inside `hostAddressWait`, a host still being refused a lease is
+    /// not — and a test that checks those by reading the wall clock around a call
+    /// which really sleeps is not testing the budget at all: it is testing how
+    /// loaded the machine running it happens to be, and it goes red on a busy CI
+    /// runner while the code is correct. With the clock injected, a test advances
+    /// time itself and the budget is checked exactly, without sleeping. Production
+    /// passes a `ContinuousClock` and behaves as it always did.
     func resolveWiFiPathPin(to endpoint: Network.NWEndpoint,
                             readiness: WiFiReadiness) async -> WiFiPathPin {
+        await resolveWiFiPathPin(to: endpoint, readiness: readiness, clock: ContinuousClock())
+    }
+
+    func resolveWiFiPathPin<C: Clock>(to endpoint: Network.NWEndpoint,
+                                      readiness: WiFiReadiness,
+                                      clock: C) async -> WiFiPathPin where C.Duration == Duration {
         let lister = hostInterfaces
         var held = lister()
         var pin = WiFiPathPin.choose(reaching: endpoint, among: held)
         guard case .hostNotOnTheDeviceSubnet = pin else { return pin }
-        let clock = ContinuousClock()
         let started = clock.now
         // Floored, exactly as the session keepalive's tick is: a caller who set a
         // zero poll interval did not ask for a spin loop.
@@ -1841,9 +1939,12 @@ extension PocketSession {
             let budget = held.contains { WiFiEndpoint.isSelfAssigned($0.address) }
                 ? readiness.timeout
                 : min(readiness.timeout, readiness.hostAddressWait)
-            guard clock.now - started < budget else { return pin }
+            // `started.duration(to:)` and not `clock.now - started`: for a
+            // generic `Clock` the bare `-` resolves to `Strideable`'s, which is
+            // not this.
+            guard started.duration(to: clock.now) < budget else { return pin }
             if Task.isCancelled { return pin }
-            try? await Task.sleep(for: step)
+            try? await clock.sleep(for: step)
             held = lister()
             pin = WiFiPathPin.choose(reaching: endpoint, among: held)
             if case .interface = pin { return pin }
