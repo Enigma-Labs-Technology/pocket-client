@@ -144,7 +144,7 @@ ASCII, `&`-delimited, request/response.
 | `APP&WIFIS` | `MCU&WIFIS&<n>` (0 off / 3 AP up / 2 client associated / 1 TCP client connected) | Wi-Fi state query |
 | `APP&WIFI` | `MCU&WIFI&<ssid>&<psk>` (synchronous reply — there is no unsolicited credentials push) | AP credentials query, read-only. **Not to be confused with the forbidden provisioning command `APP&WIFI&CH&…`** |
 | `APP&WIFIO` | `MCU&WIFIO` | **Start the Wi-Fi AP** (`MCU&WIFIS&3` ~114 ms later) |
-| `APP&WPING` | `MCU&WPING` | Wi-Fi-session keepalive. (`APP&PING` appears in **no** capture — it is not a real command) |
+| `APP&WPING` | `MCU&WPING` | Wi-Fi-session keepalive. **What it keeps alive is UNVERIFIED**: the BLE session, certainly — that the access point's lifetime is extended with it is an assumption two releases rest on and nobody has measured (open item 3; `pocket-cli probe-ap-lifetime` measures it). (`APP&PING` appears in **no** capture — it is not a real command) |
 | `APP&U&WIFI` | `MCU&U&WIFI`, then repeat `MCU&U&<size>` | **Modifier, not standalone**: reroutes the upload previously selected by `APP&U&<date>&<ts>` to TCP :8475 |
 | `APP&WIFIC` | `MCU&WIFIC` | Close Wi-Fi session / AP off (official app sends it twice) |
 
@@ -432,9 +432,48 @@ lifetime is not measured; it is longer than a programmatic `NEHotspotConfigurati
 join, which is why the phone path never showed this, and shorter than a minute of
 System Settings.
 
-**How to settle it:** `pocket-cli sync-wifi <date> [count]` transfers several
-recordings in one run and prints, per recording, whether the session was reused
-or had to be restarted. Either answer is a result; record it here.
+### Does `APP&WPING` extend the access point at all? (UNVERIFIED — the assumption two releases rest on)
+
+The paragraph above contains an inference that has never been tested. `APP&WPING`
+is documented in the command table as the "Wi-Fi-session keepalive", and this
+client read that as *extending the access point*. **It may only keep the BLE
+session from idling out.** Nothing in any capture separates the two: the vendor
+app's join is programmatic and fast, so its AP never came close to expiring, and
+the pings in the capture are simply what it sends while waiting.
+
+What forces the question, from hardware on 2026-07-29: a `sync-wifi` run reached
+`MCU&WIFIS&2` — the device itself confirming the host had associated — and the
+TCP connect to `192.168.200.1:8475` still timed out after 30 s. That run was on a
+client that already pinged throughout the join. If the pings extended the AP, it
+should have worked. Two readings survive, with opposite consequences:
+
+- **`APP&WPING` does extend the AP**, and the fault is elsewhere: the device's TCP
+  listener on :8475, or the client's socket code.
+- **`APP&WPING` does not extend the AP**, in which case a manual join cannot work
+  at any human speed however the keepalive is scheduled, and the reasoning behind
+  moving the pinger before the join has to be corrected rather than repeated.
+
+**How to settle it:** `pocket-cli probe-ap-lifetime` brings the AP up with
+`APP&WIFIO`, polls `APP&WIFIS` once a second, and reports when the device takes it
+down — **with no join at all**, so no host-side variable (a stale saved password,
+a slow person in System Settings, macOS auto-joining a remembered network) can be
+mistaken for the device's own behaviour. The keepalive is a flag, so the
+experiment is two runs:
+
+```
+POCKET_SK=… swift run pocket-cli probe-ap-lifetime                # silent baseline
+POCKET_SK=… swift run pocket-cli probe-ap-lifetime --keepalive    # the same, pinging
+```
+
+The difference between the two lifetimes is the answer, and each transcript
+carries the cadence that produced it, every state transition, and absolute
+elapsed times from the `MCU&WIFIO` ack. Paste both here. A negative result
+settles this section just as well as a positive one — and if it is negative, that
+is a correction to record against the fix above, not a detail.
+
+`pocket-cli sync-wifi <date> [count]` remains the instrument for the *other* open
+question — whether a live session will serve a second recording — and it cannot
+answer this one, because everything it does happens downstream of a join.
 
 ## App behavior observations (from captures)
 
@@ -448,7 +487,7 @@ or had to be restarted. Either answer is a result; record it here.
 
 ## Open items
 
-1. None blocking. `ffd0` / `e49a3001` / `e49a25f8` = Wi-Fi/BLE combo-chip services
+1. Not blocking. `ffd0` / `e49a3001` / `e49a25f8` = Wi-Fi/BLE combo-chip services
    (Wi-Fi OTA receive + provisioning; `ffd0` likely factory/test) — evidence:
    no references in app (Dart/Java strings, UUID fragments), zero traffic in all captures,
    Wi-Fi firmware strings contain a packetized BLE OTA receiver and app strings contain
@@ -465,6 +504,18 @@ or had to be restarted. Either answer is a result; record it here.
    recording" or "declined", and whether the device needs a settling period
    between `APP&WIFIC` and the next `APP&WIFIO` beyond reporting `MCU&WIFIS&0`
    (which the client now waits for).
+3. **Does `APP&WPING` extend the access point, or only keep the BLE session
+   alive?** Never measured, and two releases assume the former — see
+   [Does `APP&WPING` extend the access point at all?](#does-appwping-extend-the-access-point-at-all-unverified--the-assumption-two-releases-rest-on).
+   This one *is* blocking for the manual-join (macOS) Wi-Fi path: if the keepalive
+   does not extend the AP, no scheduling of it makes a human-paced join work, and
+   the fix shipped in 0.1.4 is aimed at the wrong thing. Settle it with two runs of
+   `pocket-cli probe-ap-lifetime` — once silent, once `--keepalive` — and record
+   both transcripts. Unlike item 2, this needs no join, no recording, and no
+   transfer, so nothing about the host can confound it.
+   Also unmeasured, and answered by the same transcripts: how long the AP takes to
+   come up (a single capture says ~114 ms) and whether an associated client changes
+   its lifetime.
 
 Everything needed is mapped: auth, GATT, status, inventory, BLE download, Wi-Fi transfer,
 delete, record control (STA/STO/PAU/RESU), live stream, slider query, USB mode,

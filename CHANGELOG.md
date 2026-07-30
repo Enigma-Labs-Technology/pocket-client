@@ -61,6 +61,61 @@ notes for a release before upgrading.
 
 ### Added
 
+- **A hardware probe for the assumption the last two releases rest on: does
+  `APP&WPING` extend the access point, or only keep the BLE session alive?**
+  `pocket-cli probe-ap-lifetime [--keepalive] [--cap <s>] [--poll <s>] [--ping <s>]`,
+  and `PocketSession`/`PocketDevice.probeAccessPointLifetime(_:onStep:)` behind it.
+
+  `APP&WPING` is documented as the "Wi-Fi-session keepalive", and this package read
+  that as *extending the access point*: 0.1.3 pings during the TCP connect, and
+  0.1.4 moved the pinger to start before the join precisely so a human-paced manual
+  join would be covered by it. **Neither release measured it.** No capture
+  separates the two readings either — the vendor app's join is programmatic and
+  fast, so its access point never came close to expiring. What forces the question
+  is a `sync-wifi` run on 2026-07-29 that reached `MCU&WIFIS&2` — the device itself
+  confirming the Mac had associated — and whose TCP connect to
+  `192.168.200.1:8475` still timed out after 30 s with the keepalive running
+  throughout. Either the keepalive works and the fault is elsewhere (the device's
+  listener, or this client's socket code), or it does not and no scheduling of it
+  makes a manual join work at human speed.
+
+  The probe brings the access point up (`APP&WIFIO`), polls `APP&WIFIS` on a fixed
+  cadence, prints every state with an absolute elapsed time from the `MCU&WIFIO`
+  ack, and stops when the device reports the access point off or at a cap — **with
+  no join at all**. That is the design point: no association, no DHCP, no socket,
+  so no host-side variable (a stale saved password, a slow person in System
+  Settings, macOS auto-joining a remembered network) can be mistaken for the
+  device's own behaviour, and the device's `APP&WIFIS` is the only witness. The
+  keepalive is a flag, so the experiment is two runs — once silent for the
+  unassisted baseline, once pinging — and the difference between the two lifetimes
+  is the answer.
+
+  **The verdict is typed, and honest about what one run cannot show.** Each of the
+  four findings names the run that is still missing and what each possible
+  comparison would mean, because a single run cannot distinguish the readings and a
+  transcript that reads like an answer would be worse than no transcript. Two
+  further honesty checks are built in: `APP&WPING` sent with no `MCU&WPING` back is
+  called out, since a conclusion about a keepalive the device may never have
+  received is worthless; and an association observed during a run that never joins
+  marks the run confounded.
+
+  The access point is closed on **every** exit, interruption included — a
+  still-broadcasting AP competes with BLE for the same 2.4 GHz radio, which is why
+  the transfer code already sends `APP&WIFIC` on all of its failure paths. The
+  first Ctrl-C cancels the watch, closes the access point, and reports what was
+  measured; only a second abandons the run, and says what that costs. The close
+  frames go out from a task that does not inherit cancellation, so a cancelled run
+  cannot skip them, and the probe confirms the close with one more `APP&WIFIS`
+  rather than assuming it.
+
+  Additive and read-only with respect to everything that already worked: no
+  transfer behaviour changes, no new command, no new error case, and the probe
+  claims the same exclusive transfer slot the downloads do so nothing can fight it
+  for the radio. The AP password arrives with the SSID in the `APP&WIFI` reply and
+  is discarded unread — nothing joins, so it is never needed and can never reach a
+  transcript. Recorded as open item 3 in `docs/protocol/ble-protocol.md`, and as
+  the second `unverified` entry in the README's ledger.
+
 - **One Wi-Fi access-point session for a whole sync, instead of one per
   recording — the reuse itself `unverified`.** `PocketSession` and `PocketDevice`
   gained `downloadOverWiFi(_ recordings:into:…)`, which brings the access point up

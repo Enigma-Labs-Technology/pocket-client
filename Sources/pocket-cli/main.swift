@@ -13,6 +13,7 @@
 //   swift run pocket-cli list                       — dates + recordings
 //   swift run pocket-cli download <date> <ts> [ble|wifi]
 //   swift run pocket-cli sync-wifi <date> [count]   — N recordings, ONE access-point session
+//   swift run pocket-cli probe-ap-lifetime [--keepalive] — how long the AP stays up
 //   swift run pocket-cli record [start|stop|pause|resume]
 //   swift run pocket-cli listen [seconds]           — live MP3 to live.mp3
 //   swift run pocket-cli raw WIFIS --listen 20      — one allowlisted probe, print all replies
@@ -49,6 +50,20 @@ subcommands:
                                     per recording the moment the device refuses. On this
                                     Mac you should be asked to join the network once if
                                     reuse works, and once per recording if it does not.
+  probe-ap-lifetime [--keepalive] [--cap <s>] [--poll <s>] [--ping <s>]
+                                    measure how long the recorder keeps its WiFi access
+                                    point up, and whether APP&WPING extends it. Brings the
+                                    AP up (APP&WIFIO), polls APP&WIFIS every --poll seconds
+                                    (default 1) printing every state with its elapsed time,
+                                    and stops when the device reports the AP off or at
+                                    --cap seconds (default 180). NOTHING JOINS the AP — no
+                                    association, no DHCP, no socket — so only the device's
+                                    own report is measured. --keepalive sends APP&WPING
+                                    every --ping seconds (default 10) meanwhile: run it
+                                    once WITHOUT and once WITH, and the difference in
+                                    lifetime is the answer. Two releases assume the
+                                    keepalive extends the AP and nobody has measured it.
+                                    Ctrl-C closes the AP and reports what it saw.
   record [start|stop|pause|resume]  recording control (default start)
   listen [seconds]                  capture live MP3 to live.mp3 (default 10 s)
   raw <VERB> [args…] [--listen <seconds>]
@@ -503,6 +518,10 @@ var adoptKey: String?
 /// pull in one access-point session.
 var syncWiFiCount = 3
 
+/// Set by the `probe-ap-lifetime` validation below: the access-point lifetime
+/// experiment's cadence, cap, and whether it sends `APP&WPING`.
+var apLifetimeSettings = AccessPointLifetimeSettings()
+
 switch subcommand {
 case "help", "--help", "-h":
     print(usageText)
@@ -565,6 +584,10 @@ case "sync-wifi":
         }
         syncWiFiCount = parsed
     }
+case "probe-ap-lifetime":
+    // Every flag is checkable without a radio, and a bad cadence must not cost
+    // the operator a three-minute run to discover.
+    apLifetimeSettings = accessPointLifetimeSettings(from: Array(arguments.dropFirst()))
 case "record":
     let verb = arguments.count >= 2 ? arguments[1] : "start"
     guard ["start", "stop", "pause", "resume"].contains(verb) else {
@@ -758,6 +781,9 @@ do {
 
     case "sync-wifi":
         try await runWiFiBatchSync(device: device, date: arguments[1], count: syncWiFiCount)
+
+    case "probe-ap-lifetime":
+        try await runAccessPointLifetimeProbe(device: device, settings: apLifetimeSettings)
 
     case "record":
         switch arguments.count >= 2 ? arguments[1] : "start" {

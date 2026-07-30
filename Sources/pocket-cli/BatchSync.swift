@@ -21,7 +21,12 @@ import PocketClient
 /// captured transcript instead of as one line the terminal breaks wherever it
 /// happens to run out of width. Whitespace-collapsing by construction, which is
 /// what is wanted here: the input is a sentence, not layout.
-private func wrappedForTranscript(_ text: String, indent: String, width: Int = 76) -> String {
+///
+/// Shared with `probe-ap-lifetime`, whose verdict is several paragraphs of the
+/// same kind of prose. Both commands exist to produce transcripts somebody will
+/// paste into the protocol reference, and a paragraph the terminal broke mid-word
+/// is a paragraph that arrives there mangled.
+func wrappedForTranscript(_ text: String, indent: String, width: Int = 76) -> String {
     var lines: [String] = []
     var current = ""
     for word in text.split(whereSeparator: \.isWhitespace) {

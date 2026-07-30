@@ -998,11 +998,25 @@ no longer there. The only symptom that reached the process was
 
 **So the `APP&WPING` keepalive spans the join itself**, not just the stretches
 after it. It starts before `joiner.join(ssid:passphrase:)` is called and runs until
-the session closes, so the BLE link — and with it the device's willingness to keep
-the AP up — survives a human-paced association. This is not specific to the manual
-joiner: `SystemHotspotJoiner` waits on the iOS *"wants to join"* alert, which is
-the same shape of pause and merely faster today, and a custom `HotspotJoining` gets
-the same protection because the keepalive is started before any joiner runs.
+the session closes, so the BLE link survives a human-paced association. This is not
+specific to the manual joiner: `SystemHotspotJoiner` waits on the iOS *"wants to
+join"* alert, which is the same shape of pause and merely faster today, and a
+custom `HotspotJoining` gets the same protection because the keepalive is started
+before any joiner runs.
+
+> [!WARNING]
+> **That the keepalive takes the *access point* with it is an assumption, and it is
+> `unverified`.** `APP&WPING` is documented as the "Wi-Fi-session keepalive"; that
+> it extends the AP's lifetime rather than only holding the BLE session open has
+> never been measured. On 2026-07-29 a `sync-wifi` run reached `MCU&WIFIS&2` — the
+> device confirming the Mac had associated — and the TCP connect still timed out
+> after 30 s with this keepalive running throughout. Either the keepalive works and
+> something else is wrong (the device's listener on :8475, or this client's socket
+> code), or it does not and no scheduling of it can make a manual join work at
+> human speed. [`pocket-cli probe-ap-lifetime`](#probe-ap-lifetime--does-appwping-extend-the-access-point)
+> measures it directly, in two runs, without joining anything. Until both have been
+> run, treat the fix above as a fix to the BLE link's survival — which it
+> demonstrably is — and not as a proven fix to the access point's.
 
 **A blocking read has to leave the cooperative pool for that to be true.**
 `readLine()` blocks its thread for as long as the operator takes, and Swift
@@ -1591,6 +1605,7 @@ POCKET_SK=ExampleKey000000 swift run pocket-cli connect 00000000-0000-0000-0000-
 POCKET_SK=ExampleKey000000 swift run pocket-cli list
 POCKET_SK=ExampleKey000000 swift run pocket-cli download 2026-01-04 20260104101500 wifi
 POCKET_SK=ExampleKey000000 swift run pocket-cli sync-wifi 2026-01-04 3
+POCKET_SK=ExampleKey000000 swift run pocket-cli probe-ap-lifetime --keepalive
 POCKET_SK=ExampleKey000000 swift run pocket-cli record start
 POCKET_SK=ExampleKey000000 swift run pocket-cli listen 10
 POCKET_SK=ExampleKey000000 swift run pocket-cli raw WIFIS --listen 20
@@ -1613,6 +1628,7 @@ With no subcommand it runs `probe`.
 | `list` | — | Dates, then recordings per date, with duration and estimated size. Each call timed. | required |
 | `download` | `<date> <ts> [ble\|wifi]` (default `ble`) | Looks the recording up in the day's listing (for its duration), streams it to `<ts>.mp3`, then reads the file back to report true size, KB/s, and its first four bytes for the `FF F3 48 C4` eyeball check. | required |
 | `sync-wifi` | `<date> [count]` (default 3) | Streams the day's first `count` recordings to `<ts>.mp3` over **one** access-point session, printing per recording whether the session was `REUSED` or had to be `RESTARTED`, then a verdict. See [`sync-wifi`](#sync-wifi--the-reuse-experiment). | required |
+| `probe-ap-lifetime` | `[--keepalive] [--cap <s>] [--poll <s>] [--ping <s>]` (defaults: no keepalive, 180 s cap, 1 s polls, 10 s pings) | Brings the access point up and times how long the device keeps it, polling `APP&WIFIS` and printing every state with its elapsed time. **Joins nothing.** `--keepalive` sends `APP&WPING` meanwhile: run it both ways and the difference is the answer. See [`probe-ap-lifetime`](#probe-ap-lifetime--does-appwping-extend-the-access-point). | required |
 | `record` | `[start\|stop\|pause\|resume]` (default `start`) | `start` prints the new `RecordingID`; `stop` stops. `pause`/`resume` connect, then print the firmware verdict — neither frame is ever sent. | required |
 | `listen` | `[seconds]` (default 10) | Captures live audio to `live.mp3`, reporting time-to-first-chunk and chunk count. | required |
 | `raw` | `<VERB> [--listen <s>]` (default window 15 s) | Sends **one** allowlisted probe frame, then prints every frame the device sends back with millisecond timestamps. | required |
@@ -1648,6 +1664,64 @@ refusal is just as useful an answer as a success — it settles the open item in
 Because the Mac join is manual, the run is also its own control: you should be
 asked to join the network **once** if reuse works and once per recording if it
 does not.
+
+### `probe-ap-lifetime` — does `APP&WPING` extend the access point?
+
+The assumption two releases rest on, and nobody has measured it.
+
+`APP&WPING` is documented as the "Wi-Fi-session keepalive", and this package read
+that as *extending the access point*: 0.1.3 pings during the TCP connect, and
+0.1.4 moved the pinger to start **before** the join so a human-paced manual join
+would be covered by it ([The access point does not wait for
+you](#the-access-point-does-not-wait-for-you)). It may only keep the BLE session
+from idling out. On 2026-07-29 a `sync-wifi` run reached `MCU&WIFIS&2` — the
+device itself confirming the Mac had associated — and the TCP connect still timed
+out after 30 s with the keepalive running throughout, which leaves two readings:
+
+- `APP&WPING` **does** extend the access point, and the fault is elsewhere — the
+  device's TCP listener on :8475, or this client's socket code.
+- `APP&WPING` **does not**, in which case a manual join cannot work at any human
+  speed however the keepalive is scheduled.
+
+This command measures it, and the design is what makes the numbers trustworthy:
+it brings the access point up (`APP&WIFIO`), polls `APP&WIFIS` on a fixed cadence,
+and reports when the device takes it down — **with no join at all**. No
+association, no DHCP, no socket, so no host-side variable (a stale saved password,
+a slow person in System Settings, macOS auto-joining a remembered network) can be
+mistaken for the device's own behaviour. The access point is closed on every exit,
+Ctrl-C included: the first interrupt closes it and reports what was measured, and
+only a second one abandons the run.
+
+The keepalive is a flag, so the experiment is **two runs**:
+
+```bash
+POCKET_SK=ExampleKey000000 swift run pocket-cli probe-ap-lifetime               # silent baseline
+POCKET_SK=ExampleKey000000 swift run pocket-cli probe-ap-lifetime --keepalive   # the same, pinging
+```
+
+Each prints its cadence, then every poll with an absolute elapsed time from the
+`MCU&WIFIO` ack (`*` marks a state change), then the numbers, then a verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `the unassisted access-point lifetime on this device is T` | The silent baseline: the device took its own access point down after `T`. Half the experiment. |
+| `APP&WPING DID NOT KEEP THE ACCESS POINT UP` | It went off while pings were going out. If the silent run's `T` is about the same, the keepalive does not extend the access point — **and that is a correction to record against 0.1.3 and 0.1.4**, not a detail. |
+| `THE ACCESS POINT WAS STILL UP at the cap` (pinging) | Consistent with the keepalive extending it — but only if the silent run died sooner. If both reach the cap, the cap measures nothing. |
+| `the access point was still up at the cap ... with no keepalive at all` | The cap is shorter than this device's unaided lifetime: raise it. This one also bears on the original failure — if the cap already exceeds the pause that lost the AP on hardware, then AP lifetime did not cause it, and the listener or the socket code did. |
+| `INCONCLUSIVE` | The run was interrupted, lost the link, or asked for a keepalive whose first ping was never due. It says which. |
+
+Every verdict names the run that is still missing and what each possible
+comparison would mean, because **one run cannot distinguish the two readings** and
+a transcript that reads like an answer would be worse than none. Two extra
+honesty checks are built in: a keepalive that goes unanswered (`APP&WPING` sent,
+no `MCU&WPING` back) is called out, because a conclusion about a keepalive the
+device may never have seen is worthless; and an association appearing during a run
+that never joins (`MCU&WIFIS&2`) marks the run confounded, since that is this Mac
+auto-joining a network it remembers.
+
+The transcript is the deliverable — capture both and paste them into
+[the protocol reference](docs/protocol/ble-protocol.md), which carries this as
+open item 3.
 
 ### `raw`
 
@@ -1792,9 +1866,26 @@ unadopted-leftover branch found it broken, in a way that killed the restored lin
 on a background relaunch. Fixed in 0.1.1. What the tests still cannot establish
 is whether iOS relaunches the app and hands back the peripherals we assume.
 
-**`unverified`** — one thing, and it is a question rather than a claim: **whether
-the device will serve a second `APP&U&<date>&<ts>` while its access point is still
-up.** Nobody has tried. The capture the protocol was decoded from covered a
+**`unverified`** — two things, and both are questions rather than claims.
+
+**Whether `APP&WPING` extends the access point, or only keeps the BLE session
+alive.** It is documented as the "Wi-Fi-session keepalive" and this package read
+that as the former: 0.1.3 pings during the TCP connect, 0.1.4 moved the pinger
+before the join. Neither release measured it, and no capture separates the two —
+the vendor app's join is programmatic and fast, so its access point never came
+close to expiring. It matters more than the other question: if the keepalive does
+not extend the access point, the macOS manual-join path cannot work at any human
+speed however the pinger is scheduled, and the reasoning in
+[The access point does not wait for you](#the-access-point-does-not-wait-for-you)
+has to be corrected rather than repeated.
+[`pocket-cli probe-ap-lifetime`](#probe-ap-lifetime--does-appwping-extend-the-access-point)
+settles it in two runs, one silent and one pinging, and joins nothing — so nothing
+about the host can confound the answer. What is *not* in question is that the
+keepalive keeps the BLE link up: an `MCU&WPING` arriving mid-attempt on hardware
+showed that much.
+
+**Whether the device will serve a second `APP&U&<date>&<ts>` while its access point
+is still up.** Nobody has tried. The capture the protocol was decoded from covered a
 single-file sync, and there is no firmware string or app behaviour to infer from
 either — this is not a weak claim, it is an absence of one. It matters because a
 session per recording means a join prompt per recording (ten of them, watched on

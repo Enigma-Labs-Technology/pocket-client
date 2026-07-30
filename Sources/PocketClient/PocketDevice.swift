@@ -166,6 +166,28 @@ public actor PocketDevice {
                                            onProgress: onProgress)
     }
 
+    /// Measures how long this device keeps its Wi-Fi access point up, and whether
+    /// `APP&WPING` extends it — see
+    /// `PocketSession.probeAccessPointLifetime(_:onStep:)` for the full contract
+    /// and for why the answer matters to every Wi-Fi transfer this package makes.
+    ///
+    /// An instrument, not a feature: it transfers nothing and changes no transfer
+    /// behaviour. It takes no `HotspotJoining` and ignores this device's, because
+    /// **nothing joins the access point** — the device's own `APP&WIFIS` is the
+    /// only witness, which is what keeps every host-side variable out of the
+    /// measurement. The access point is closed on every exit, cancellation
+    /// included.
+    ///
+    /// One run is half the experiment: run it once with `keepalive` off and once
+    /// with it on, and compare. `AccessPointLifetime.verdict` says what each run
+    /// established and names the run still missing.
+    public func probeAccessPointLifetime(
+        _ settings: AccessPointLifetimeSettings = AccessPointLifetimeSettings(),
+        onStep: (@Sendable (AccessPointProbeStep) -> Void)? = nil
+    ) async throws -> AccessPointLifetime {
+        try await session.probeAccessPointLifetime(settings, onStep: onStep)
+    }
+
     /// The `.auto` routing policy both download shapes share — one place, so
     /// the fallback rules cannot drift: WiFi first when the mode resolves
     /// there, degrading to BLE only for `.auto`, and never for caller
