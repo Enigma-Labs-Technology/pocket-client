@@ -212,7 +212,7 @@ device.)
 Most READMEs oversell. The protocol reference
 ([`docs/protocol/ble-protocol.md`](docs/protocol/ble-protocol.md)) grades every
 claim it makes by how it was established, and this document holds itself to the
-same standard. Every capability below carries one of four tags:
+same standard. Every capability below carries one of five tags:
 
 | Tag | Meaning |
 |---|---|
@@ -220,6 +220,7 @@ same standard. Every capability below carries one of four tags:
 | `probed` | Settled by sending the frame and reading the answer. Includes **negative** results: "the firmware says `MCU&UNKNOWN`" is a result. |
 | `compile-only` | Compiles, and is unit-tested wherever the logic is pure — but the code path has never executed against real hardware or a real phone. |
 | `inferred` | Reasoned from firmware strings, the vendor app's string tables, and the absence of traffic in every capture. Not proven. Treated as a reason for caution, never as a licence to act. |
+| `unverified` | The code is written and tested against a fake device, but the **device** behaviour it depends on has never been observed — not inferred from strings either, simply never tried. Weaker than `inferred`, which at least has evidence. Anything tagged this way is built to attempt the unknown and fall back to something already proven. |
 
 > [!NOTE]
 > **The sample size is one.** Every `hardware` claim rests on a single physical
@@ -247,6 +248,7 @@ the index.
 | `MCU&RT` is one-shot | It fires once at connect when a recording is already running, and **never repeats**. Nothing on the wire advances elapsed time; any UI clock must run locally from that anchor. | [8 · Watch for events](#8--watch-for-events) |
 | Rotating the key breaks saved Wi-Fi | The AP password is the session key's first 8 characters and follows the live binding, but the SSID is the BLE name and does not change. Every host that joined before the rotation keeps offering the old password and fails, and **no app can clear a user-saved network** — it must be forgotten by hand. | [When the join fails](#when-the-join-fails) |
 | Ten bytes past the end | A Wi-Fi transfer's TCP stream carries a short trailer (10 bytes observed) past the announced length. The announced count is authoritative; drain-to-EOF overshoots and fails an exact-length check. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
+| One Wi-Fi session per recording means one join prompt per recording | `joinOnce = true` makes iOS discard the configuration on disassociation, so a ten-file sync asks the person to join ten times and pays the ~6.5 s association ten times. Batching them into one session avoids that — **if** the device serves a second selection, which nobody has ever tried. | [One access-point session for a whole sync](#one-access-point-session-for-a-whole-sync) |
 | `APP&SHUT` may never answer | On an idle device there is **no** `MCU&SHUT`. Blocking on the reply hangs the happy path. | [12 · Go below the session](#12--go-below-the-session) |
 | `APP&U&WIFI` is a modifier | It reroutes the upload already selected by `APP&U&<date>&<ts>` to the TCP socket. Sent alone it has nothing to reroute. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
 | `WiFiState` counts *down* | The progression is `0` off → `3` AP up → `2` client associated → `1` TCP connected. The numbers are not a sequence. | [5 · Get the audio off it](#5--get-the-audio-off-it) |
@@ -772,6 +774,79 @@ public enum WiFiState: Int, Sendable, Equatable {
 
 State `1` means the TCP client is connected on `:8475`. It is reported **before**
 any upload command, so it does not mean "transferring".
+
+### One access-point session for a whole sync
+
+**Evidence:** `unverified`. The batch mechanics are unit-tested against a fake
+device on both branches of the unknown below, and neither branch has run against
+hardware.
+
+A session is expensive. The handshake plus the association wait costs about
+**6.5 s for the association alone**, and on iOS `joinOnce = true` makes the OS
+discard the configuration the moment the phone disassociates. So syncing one
+recording per session asks the person to join the network *once per recording*.
+Watched happening on 2026-07-29: ten recordings, ~354 MB, ten join prompts.
+
+```swift
+let result = try await device.downloadOverWiFi(
+    recordings,
+    into: .files { URL(fileURLWithPath: "\($0.id.timestamp).mp3") })
+
+result.delivered          // one outcome per recording that arrived, in order
+result.stopped            // nil ⇔ all of them; otherwise which one stopped the run
+result.didReuseSession    // did the device serve a second selection on a live AP?
+result.refusals           // …or did it refuse, and what did it say?
+result.sessionsOpened     // 1 is the win; delivered.count is the fallback
+```
+
+> [!WARNING]
+> **The reuse is `unverified`, and that is the whole point of the API shape.**
+> Nobody has ever issued a second `APP&U&<date>&<ts>` while the access point was
+> still up — the capture this protocol was decoded from covered a single-file
+> sync — so the device may serve it, refuse it, or do something else. The run
+> **attempts** reuse and falls back cleanly: the moment the device will not serve
+> a recording on the live session, the session is torn down properly (`APP&SHUT` +
+> `APP&WIFIC`, then leave the network) and a fresh one is opened for that
+> recording, and reuse is not attempted again in that run. **The worst case is
+> exactly one session per recording** — today's behaviour — never a wedged device
+> or a half-open access point. Every refusal is decided *before* a payload byte of
+> that recording has flowed, which is what makes the restart safe.
+>
+> Settle it on your own device with
+> [`pocket-cli sync-wifi`](#sync-wifi--the-reuse-experiment) and please record the
+> answer; either one is a result.
+
+Five things to know:
+
+1. **Partial progress is kept, and the run does not throw for it.** It stops at
+   the first recording it cannot deliver — a failure on recording 4 of 10 must not
+   lose 1–3 — and reports `stopped.recording`, `stopped.reason`,
+   `stopped.error` (a `PocketError` when it was one, so you can drop an
+   `.emptyRecording` and re-batch), and `stopped.remaining`. What to do about the
+   remainder is yours to decide, which is why it stops rather than guessing. It
+   throws only for `PocketError.busy` (another transfer holds the device's single
+   transfer engine) and for caller cancellation.
+2. **Every exit path closes the access point**, cancellation included. A still-
+   broadcasting AP competes with BLE for the same 2.4 GHz radio, so this is not
+   tidiness.
+3. **A restart waits for the access point to actually be off.** Before reopening
+   (never before the first session), the client polls `APP&WIFIS` until it reports
+   `MCU&WIFIS&0` — evidence rather than a guessed sleep, and one extra round-trip
+   against a device that reports state transitions in ~100 ms. The wait is bounded,
+   and on expiry the run **stops and names the last state seen** rather than
+   sending `APP&WIFIO` onto an access point that may still be coming down. That
+   matters more than it looks: the fallback is what has to be trustworthy for the
+   experiment to mean anything, because a restart that half-works would be
+   misread as the device refusing session reuse.
+4. **The `APP&WPING` keepalive spans the session**, not just the TCP connect, and
+   fires only after the session has been genuinely idle for the ping interval —
+   never on top of a transfer that is already streaming bytes.
+5. **Wi-Fi only, deliberately.** There is no `.auto` and no BLE fallback here: a
+   batch exists to avoid repeating an AP handshake that BLE does not have, and
+   silently pushing 350 MB down a ~35 KB/s link is not a decision to make on the
+   caller's behalf. Read `stopped` and choose.
+
+An empty array is a no-op that never touches the radio.
 
 ### Who joins the access point
 
@@ -1463,6 +1538,7 @@ POCKET_SK=ExampleKey000000 swift run pocket-cli probe
 POCKET_SK=ExampleKey000000 swift run pocket-cli connect 00000000-0000-0000-0000-000000000000
 POCKET_SK=ExampleKey000000 swift run pocket-cli list
 POCKET_SK=ExampleKey000000 swift run pocket-cli download 2026-01-04 20260104101500 wifi
+POCKET_SK=ExampleKey000000 swift run pocket-cli sync-wifi 2026-01-04 3
 POCKET_SK=ExampleKey000000 swift run pocket-cli record start
 POCKET_SK=ExampleKey000000 swift run pocket-cli listen 10
 POCKET_SK=ExampleKey000000 swift run pocket-cli raw WIFIS --listen 20
@@ -1484,12 +1560,42 @@ With no subcommand it runs `probe`.
 | `connect` | `<identifier>` | Same as `probe` but connects to exactly one peripheral identifier — no scan, no fallback. Validates the UUID before touching the radio. | required |
 | `list` | — | Dates, then recordings per date, with duration and estimated size. Each call timed. | required |
 | `download` | `<date> <ts> [ble\|wifi]` (default `ble`) | Looks the recording up in the day's listing (for its duration), streams it to `<ts>.mp3`, then reads the file back to report true size, KB/s, and its first four bytes for the `FF F3 48 C4` eyeball check. | required |
+| `sync-wifi` | `<date> [count]` (default 3) | Streams the day's first `count` recordings to `<ts>.mp3` over **one** access-point session, printing per recording whether the session was `REUSED` or had to be `RESTARTED`, then a verdict. See [`sync-wifi`](#sync-wifi--the-reuse-experiment). | required |
 | `record` | `[start\|stop\|pause\|resume]` (default `start`) | `start` prints the new `RecordingID`; `stop` stops. `pause`/`resume` connect, then print the firmware verdict — neither frame is ever sent. | required |
 | `listen` | `[seconds]` (default 10) | Captures live audio to `live.mp3`, reporting time-to-first-chunk and chunk count. | required |
 | `raw` | `<VERB> [--listen <s>]` (default window 15 s) | Sends **one** allowlisted probe frame, then prints every frame the device sends back with millisecond timestamps. | required |
 | `probe-unverified` | — | Sends `APP&PAU` then `APP&RESU` and prints exactly what the device answers, with an honest verdict per command. | required |
 | `adopt` | `[key]` | Binds a self-generated (or supplied) 16-character key to an **unbound** device, then proves it persisted. | not needed |
 | `reset` | `--wipe-all-recordings` | **Destroys every recording** and clears the binding. | required |
+
+### `sync-wifi` — the reuse experiment
+
+The one part of
+[One access-point session for a whole sync](#one-access-point-session-for-a-whole-sync)
+that cannot be settled without a device. It fetches several recordings in one run
+and its per-recording `session:` lines *are* the result — capture the transcript.
+
+```
+POCKET_SK=ExampleKey000000 swift run pocket-cli sync-wifi 2026-01-04 3
+```
+
+Each recording reports one of four things, and only the second is news:
+
+| Line | Meaning |
+|---|---|
+| `OPENED` | The first recording: full handshake, join, association wait. |
+| `REUSED` | Served on the session an earlier recording opened. **This is the answer we do not have** — if it appears, the device does serve a second `APP&U&<date>&<ts>` on a live AP. |
+| `RESTARTED` | The device would not serve this recording on the live session, and the refusal is printed verbatim. The session was torn down and reopened; nothing was lost. |
+| `OWN` | Reuse was already ruled out this run, so this recording opened its own session — exactly what `download … wifi` does per file. |
+
+Then a verdict: `SESSION REUSE WORKS`, `SESSION REUSE IS REFUSED` (with what the
+device said), or `INCONCLUSIVE` when no recording ever got as far as asking. A
+refusal is just as useful an answer as a success — it settles the open item in
+[the protocol reference](docs/protocol/ble-protocol.md) either way.
+
+Because the Mac join is manual, the run is also its own control: you should be
+asked to join the network **once** if reuse works and once per recording if it
+does not.
 
 ### `raw`
 
@@ -1633,6 +1739,19 @@ a fake radio, and that is not a formality: the first test to reach the
 unadopted-leftover branch found it broken, in a way that killed the restored link
 on a background relaunch. Fixed in 0.1.1. What the tests still cannot establish
 is whether iOS relaunches the app and hands back the peripherals we assume.
+
+**`unverified`** — one thing, and it is a question rather than a claim: **whether
+the device will serve a second `APP&U&<date>&<ts>` while its access point is still
+up.** Nobody has tried. The capture the protocol was decoded from covered a
+single-file sync, and there is no firmware string or app behaviour to infer from
+either — this is not a weak claim, it is an absence of one. It matters because a
+session per recording means a join prompt per recording (ten of them, watched on
+2026-07-29). So `downloadOverWiFi(_ recordings:)` attempts reuse, detects a
+refusal before any payload byte of the affected recording has flowed, tears the
+session down properly, and continues one-session-per-recording — which is exactly
+the behaviour that *is* `hardware`. `pocket-cli sync-wifi` exists to answer it;
+until it has been run, believe nothing about the reuse and everything about the
+fallback.
 
 **`inferred`** — four things, and each is treated as a reason for caution rather
 than a claim:

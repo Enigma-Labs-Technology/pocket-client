@@ -314,6 +314,99 @@ opening the access point, which is most of what the rotation was for.
 Security note: SK is the root secret for both BLE auth and the Wi-Fi AP password —
 anyone holding SK can join the AP and pull every recording.
 
+### Reusing one AP session for several recordings (UNVERIFIED — never attempted on hardware)
+
+**The open question.** Step 7 selects a recording with `APP&U&<date>&<ts>`, step 8
+serves it and ends with `MCU&OFF`, and the app then closes the session with
+`APP&WIFIC` ×2. **Nobody has ever issued a second `APP&U&<date>&<ts>` while the
+access point was still up.** The capture this section was decoded from covered a
+single-file sync, so the device's behaviour is genuinely unknown: it may serve a
+second file, refuse, or do something worse. Nothing below is a claim about the
+device — this section records the question, why it matters, and how the client
+asks it safely.
+
+**Why it matters.** A session is expensive. Steps 1–5 cost the
+`SHUT → WIFIS → WIFI → WIFIO` handshake plus about **6.5 s for the association
+alone**, and on iOS `NEHotspotConfiguration.joinOnce` makes the OS discard the
+configuration when the phone disassociates — so a session per recording means a
+join prompt per recording. Watched on hardware 2026-07-29: a sync of ten
+recordings (~354 MB in 30–50 MB files) asked the operator to join the network ten
+times and paid the handshake ten times.
+
+**How the client asks.** `PocketSession.downloadOverWiFi(_ recordings:…)`
+*attempts* reuse and falls back cleanly, so the worst case is the
+one-session-per-recording behaviour and never a wedged device:
+
+1. Steps 1–5 run once. The access point stays up and the host stays associated.
+2. Per recording: poll `APP&WIFIS`, open a **fresh TCP connection** to
+   `192.168.200.1:8475` — the device closes the socket at `MCU&OFF` (TCP FIN at
+   the same instant), so the socket never carries over; the AP and the
+   association do — then `APP&U&<date>&<ts>` and `APP&U&WIFI` as in step 7.
+3. `APP&WIFIC` ×2 once, at the end.
+
+**What counts as a refusal.** Every one of these is observed *before* a single
+payload byte of the new recording has flowed, which is what makes a clean restart
+safe:
+
+| Observation | Reading |
+|---|---|
+| `MCU&WIFIS&0` on the poll between recordings | The device closed its own session after `MCU&OFF`. The likeliest shape, if reuse turns out not to work. |
+| `MCU&WIFIS&3` on that poll | The AP is up with no associated client: the *host* left the network between recordings (`joinOnce`). Restarting is what re-joins. |
+| TCP connect to `:8475` refused or timed out | The device stopped listening after the first transfer. |
+| `MCU&UNKNOWN`, no reply, or an unexpected shape to the second `APP&U&<date>&<ts>` | The device will not accept a second selection. |
+| No `MCU&U&WIFI` for the second `APP&U&WIFI` | It accepted the selection but will not reroute it to the socket again. |
+
+On any of those the client sends `APP&SHUT` + `APP&WIFIC`, leaves the network,
+and opens a fresh session for that same recording — and then **stops attempting
+reuse for the rest of the run**, because a doomed attempt plus a teardown per
+recording is worse than not trying.
+
+Two deliberate non-refusals:
+
+- **No answer to the `APP&WIFIS` poll.** Silence is not evidence. A firmware that
+  stops answering `APP&WIFIS` must not be read as having closed its session; the
+  selection decides.
+- **`MCU&U&0` on a reused session.** Ambiguous in principle — the device *could*
+  be declining by announcing nothing — but 0-second recordings genuinely exist,
+  and treating it as a refusal would tear down a working session every time one
+  turned up in a batch. Treated as `emptyRecording`, exactly as on a fresh
+  session. **Open sub-question**, worth watching for on hardware.
+
+**A restart waits for the AP to actually be off.** A restart is the only place in
+this protocol that closes an access point and immediately reopens one, so it is
+the only place that could send `APP&WIFIO` to a device whose AP has not finished
+coming down. Whether that matters is unobserved — but the *fallback* is what has
+to be trustworthy for the experiment to mean anything: a restart that half-works
+would be read as the device refusing session reuse.
+
+So before every reopen (never before the first session, which has nothing to wait
+for) the client polls `APP&WIFIS` until it answers `MCU&WIFIS&0`. That is evidence
+rather than a guessed sleep, `WIFIS` is already this sequence's state oracle, and
+it is cheap: the device reports state transitions fast — a poll 114 ms after
+`APP&WIFIO` already reads `3` (step 4) — so a prompt device costs exactly one
+extra round-trip. The restart sequence is therefore:
+
+```
+APP&SHUT, APP&WIFIC          ← teardown
+APP&WIFIS → MCU&WIFIS&0      ← the AP really is down
+APP&SHUT, APP&WIFIS, APP&WIFI, APP&WIFIO   ← steps 1–4 of the next session
+```
+
+The wait is bounded (by the readiness timeout, capped at 5 s). **On expiry the run
+stops and says so, naming the last state seen, and no second `APP&WIFIO` is
+sent** — pressing on would build an access point on a state nothing can describe,
+which is the failure mode most likely to be misattributed.
+
+**The keepalive now spans the whole session.** `APP&WPING` used to cover one
+stretch, the TCP connect, because a session lasted one transfer. Across a batch
+there are gaps between files, so the client pings whenever the session has been
+silent for the ping interval — and only then, so nothing pings on top of a
+transfer that is already streaming bytes.
+
+**How to settle it:** `pocket-cli sync-wifi <date> [count]` transfers several
+recordings in one run and prints, per recording, whether the session was reused
+or had to be restarted. Either answer is a result; record it here.
+
 ## App behavior observations (from captures)
 
 - Sync window: app issues `LIST&<date>` for a rolling 8-day window (today ± several days)
@@ -333,6 +426,16 @@ anyone holding SK can join the AP and pull every recording.
    "WiFi OTA via BLE", `APP&OTA&WIFI&`, "BLE WiFi OTA requires MCU T22+ and WiFi V10+".
    MCU firmware is encrypted (`AOTA` container, entropy 8.0) — not analyzable offline.
    **Read-only policy: never write to these characteristics (brick risk).**
+2. **Will the device serve a second `APP&U&<date>&<ts>` while its access point is
+   still up?** Never attempted — see
+   [Reusing one AP session for several recordings](#reusing-one-ap-session-for-several-recordings-unverified--never-attempted-on-hardware).
+   Not blocking: the client attempts it and falls back to one session per
+   recording, so the worst case is the pre-existing behaviour. Settle it with
+   `pocket-cli sync-wifi <date> 3` and record the answer, whichever it is.
+   Sub-questions inside it: whether `MCU&U&0` on a reused session means "empty
+   recording" or "declined", and whether the device needs a settling period
+   between `APP&WIFIC` and the next `APP&WIFIO` beyond reporting `MCU&WIFIS&0`
+   (which the client now waits for).
 
 Everything needed is mapped: auth, GATT, status, inventory, BLE download, Wi-Fi transfer,
 delete, record control (STA/STO/PAU/RESU), live stream, slider query, USB mode,

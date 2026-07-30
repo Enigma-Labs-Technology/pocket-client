@@ -71,6 +71,16 @@ public actor PocketSession {
     /// any other battery frame keeps flowing.
     private var pendingKeepaliveEchoes = 0
 
+    /// The same bookkeeping for the WiFi-session keepalive's `APP&WPING`.
+    ///
+    /// That keepalive is deliberately fire-and-forget (see
+    /// `sendWiFiSessionKeepalive`), so its `MCU&WPING` reply arrives with no
+    /// waiter to satisfy and would otherwise surface as `.unmatchedResponse` —
+    /// once per idle gap of every batched transfer, burying the genuine
+    /// unexpected-frame diagnostic exactly as the battery echoes once did.
+    /// Absorbed one per ping sent; any other `MCU&WPING` keeps flowing.
+    private var pendingWiFiKeepaliveEchoes = 0
+
     /// Bulk chunks are consumed by whoever is transferring; nil means discard.
     private var bulkSink: ((Data) -> Void)?
 
@@ -331,6 +341,9 @@ public actor PocketSession {
             // Our own keepalive's `APP&BAT` being answered — expected link
             // filler, absorbed one echo per ping (see `pendingKeepaliveEchoes`).
             pendingKeepaliveEchoes -= 1
+        case .pong where pendingWiFiKeepaliveEchoes > 0:
+            // Our own WiFi-session keepalive's `APP&WPING` being answered.
+            pendingWiFiKeepaliveEchoes -= 1
         default:
             eventContinuation.yield(.unmatchedResponse(raw))
         }
@@ -385,6 +398,21 @@ public actor PocketSession {
         pendingKeepaliveEchoes += 1
         do { try await send(.battery) }
         catch { pendingKeepaliveEchoes -= 1 }   // nothing went out; no echo is owed
+    }
+
+    /// The WiFi session's `APP&WPING`, sent the same fire-and-forget way and
+    /// for the same reason: it must never arm a waiter.
+    ///
+    /// The session allows one armed request at a time, and a keepalive that
+    /// armed one could fail the very next `APP&U&<date>&<ts>` with `.busy` —
+    /// which a batched transfer would read as the device refusing a second
+    /// recording selection when nothing of the sort happened. Fire-and-forget
+    /// cannot collide with anything; the `MCU&WPING` echo is absorbed by
+    /// `emitAsEvent` (see `pendingWiFiKeepaliveEchoes`).
+    func sendWiFiSessionKeepalive() async {
+        pendingWiFiKeepaliveEchoes += 1
+        do { try await send(.wifiKeepalive) }
+        catch { pendingWiFiKeepaliveEchoes -= 1 }
     }
 
     /// "20260104101500" → "2026-01-04".

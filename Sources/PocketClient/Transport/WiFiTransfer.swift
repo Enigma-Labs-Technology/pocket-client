@@ -203,6 +203,13 @@ public struct WiFiReadiness: Sendable {
         self.pollInterval = pollInterval
         self.pingInterval = pingInterval
     }
+
+    /// Cap on the post-teardown wait for `MCU&WIFIS&0` before a batch reopens the
+    /// access point (`PocketSession.awaitWiFiOff`). `timeout` bounds that wait as
+    /// well; this caps it, because a caller who set a generous association
+    /// timeout did not thereby ask to wait that long for a state transition the
+    /// device reports in about 100 ms.
+    static let maximumAccessPointOffWait = Duration.seconds(5)
 }
 
 // NWEndpoint is written `Network.NWEndpoint` throughout this file: on iOS,
@@ -219,9 +226,20 @@ enum WiFiEndpoint {
     }
 }
 
-/// Wall clock of the last transfer activity, shared between the TCP reader
-/// and its stall watchdog.
-private final class ActivityMonitor: @unchecked Sendable {
+/// Wall clock of the last activity, shared between whoever produces it and
+/// whoever watches for its absence. Two watchers use this type, and they must
+/// NOT share one instance:
+///
+/// - `TCPFetch.receive`'s stall watchdog, which must fire when the device stops
+///   sending bytes;
+/// - the WiFi session keepalive, which must send `APP&WPING` when the session
+///   goes quiet (see `startWiFiSessionKeepalive`).
+///
+/// One shared instance would let every keepalive ping reset the stall watchdog,
+/// and a dead transfer would then never time out. So each transfer keeps its
+/// own monitor for the watchdog and *also* touches the session's, which is why
+/// `receive` takes `sessionActivity` separately.
+final class ActivityMonitor: @unchecked Sendable {
     private let lock = NSLock()
     private var last = ContinuousClock.now
     func touch() { lock.lock(); last = .now; lock.unlock() }
@@ -324,10 +342,16 @@ enum TCPFetch {
     /// `sink` — surplus past `expected` never reaches it. `idleTimeout`
     /// bounds how long the connection may sit with no new bytes before the
     /// fetch is declared failed and the connection torn down.
+    ///
+    /// `sessionActivity`, when given, is touched alongside this fetch's own
+    /// stall clock so the WiFi session keepalive can see that bytes are still
+    /// flowing and stay off the wire. It is deliberately a second monitor and
+    /// never the watchdog's own — see `ActivityMonitor`.
     static func receive(on connection: NWConnection,
                         expected: Int,
                         idleTimeout: Duration = .seconds(10),
                         into sink: TransferSink,
+                        sessionActivity: ActivityMonitor? = nil,
                         onProgress: (@Sendable (Double) -> Void)?) async throws -> Received {
         let activity = ActivityMonitor()
 
@@ -357,6 +381,7 @@ enum TCPFetch {
                         received += part.count
                     }
                     activity.touch()
+                    sessionActivity?.touch()
                     onProgress?(min(1.0, Double(received) / Double(max(expected, 1))))
                 }
                 return Received(surplusCount: surplusCount, surplusPreview: surplusPreview)
@@ -500,6 +525,80 @@ extension PocketSession {
         try beginTransfer()
         defer { endTransfer() }   // covers every exit path below
 
+        // Steps 1–5. `openWiFiSession` cleans up after its own failures (it is
+        // the only code that knows how far the sequence got), so nothing here
+        // needs a catch around it.
+        let session = try await openWiFiSession(joiner: joiner, readiness: readiness)
+        // From here every exit must close the AP and leave the network so the
+        // operator's own comes back. `leave()` is async, so a defer cannot
+        // await it, and a fire-and-forget Task in a defer would race callers
+        // that observe the joiner as soon as this function returns — hence
+        // the explicit do/catch instead.
+        do {
+            // 6. TCP first — the selection that follows is served into this
+            // socket, and the device reports it as MCU&WIFIS&1.
+            let connection: NWConnection
+            do {
+                connection = try await connectKeepingLinkAlive(
+                    to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness,
+                    sessionActivity: session.activity)
+            } catch {
+                throw diagnosed(connectFailure: error, ssid: session.ssid,
+                                passphrase: session.passphrase,
+                                clientAssociationObserved: session.clientAssociationObserved)
+            }
+            do {
+                // 7. Select, reroute, read exactly the announced bytes, verify.
+                let data = try await transferOverTCP(recording, connection: connection,
+                                                     sink: sink,
+                                                     sessionActivity: session.activity,
+                                                     idleTimeout: idleTimeout,
+                                                     onProgress: onProgress)
+                // 8. Close the session.
+                await closeWiFiSession(session, joiner: joiner, aborting: false)
+                return data
+            } catch {
+                connection.cancel()   // idempotent; receive() may already have
+                throw error
+            }
+        } catch {
+            await closeWiFiSession(session, joiner: joiner, aborting: true)
+            throw error
+        }
+    }
+
+    // MARK: - The access-point session
+
+    /// One live access-point session: what the device told us about it, the
+    /// idle clock its keepalive reads, and the keepalive itself.
+    ///
+    /// Held for exactly one transfer by `runWiFiTransfer` and for a whole batch
+    /// by `downloadOverWiFi(_ recordings:…)`. That is the only difference
+    /// between the two — the sequence either side of it is identical.
+    private struct WiFiSessionHandle {
+        let ssid: String
+        let passphrase: String
+        /// The device reported an associated client (`MCU&WIFIS&2`, or `1`
+        /// which subsumes it) during setup. Feeds the connect-failure
+        /// diagnosis: the device is the only witness to whether anything ever
+        /// joined the AP it was broadcasting.
+        let clientAssociationObserved: Bool
+        let activity: ActivityMonitor
+        let keepalive: Task<Void, Never>
+    }
+
+    /// Steps 1–5 of the capture-verified sequence: abort anything in flight,
+    /// read the WiFi state, read the credentials, start the AP, join it, and
+    /// wait (leniently) for the device to report the association. Returns a
+    /// live session with its keepalive running.
+    ///
+    /// Cleans up after its own failures, and the cleanup differs by how far it
+    /// got — which is why it lives here rather than in the callers:
+    /// before `APP&WIFIO` there is no AP to close; after it there is, but
+    /// nothing has joined yet, so there is nothing to leave; after the join
+    /// both apply.
+    private func openWiFiSession(joiner: HotspotJoining,
+                                 readiness: WiFiReadiness) async throws -> WiFiSessionHandle {
         // 1–2. Abort any in-flight transfer and read the WiFi state. SHUT is
         // fire-and-forget: an idle device sends no MCU&SHUT (live-probe
         // verified), so blocking on a reply would hang the happy path.
@@ -538,11 +637,7 @@ extension PocketSession {
             try? await send(.wifiClose)
             throw diagnosed(joinFailure: error, ssid: ssid, passphrase: passphrase)
         }
-        // From here every exit must also leave the AP so the operator's
-        // normal network comes back. `leave()` is async, so a defer cannot
-        // await it, and a fire-and-forget Task in a defer would race callers
-        // that observe the joiner as soon as this function returns — hence
-        // the explicit do/catch instead.
+
         do {
             // 5. Wait (leniently) for MCU&WIFIS&2: the capture shows the TCP
             // connect only after the device reports the association, and
@@ -555,34 +650,79 @@ extension PocketSession {
                 // but make sure the fact is visible to the CLI/checkpoint.
                 emitEvent(.wifiReadinessNotObserved)
             }
-            // 6. TCP first — the selection that follows is served into this
-            // socket, and the device reports it as MCU&WIFIS&1.
-            let connection: NWConnection
-            do {
-                connection = try await connectKeepingLinkAlive(
-                    to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness)
-            } catch {
-                throw diagnosed(connectFailure: error, ssid: ssid, passphrase: passphrase,
-                                clientAssociationObserved: observedJoin)
-            }
-            do {
-                let data = try await transferOverTCP(recording, connection: connection,
-                                                     sink: sink,
-                                                     idleTimeout: idleTimeout,
-                                                     onProgress: onProgress)
-                await joiner.leave()
-                return data
-            } catch {
-                connection.cancel()   // idempotent; receive() may already have
-                throw error
-            }
+            let activity = ActivityMonitor()
+            return WiFiSessionHandle(
+                ssid: ssid, passphrase: passphrase,
+                clientAssociationObserved: observedJoin,
+                activity: activity,
+                keepalive: startWiFiSessionKeepalive(activity, readiness: readiness))
         } catch {
-            // Best-effort abort of a possibly selected upload (SHUT has no
-            // reply when nothing is in flight), then close the AP.
+            // Past the join, so the full teardown applies.
             try? await send(.wifiShutdown)
             try? await send(.wifiClose)
             await joiner.leave()
             throw error
+        }
+    }
+
+    /// Closes the access point and leaves the network. Best effort throughout:
+    /// this runs on paths where the link may already be gone, and an AP left
+    /// broadcasting into the BLE fallback is worse than a lost error.
+    ///
+    /// `aborting` picks between the two shapes the capture and the field
+    /// established:
+    ///
+    /// - a completed transfer sends `APP&WIFIC` **twice**, mirroring the vendor
+    ///   app's traffic (the device tolerates the redundant close);
+    /// - a failure first sends `APP&SHUT` to abort an upload that may already be
+    ///   selected (no reply arrives when nothing is in flight) and then closes
+    ///   once.
+    private func closeWiFiSession(_ session: WiFiSessionHandle,
+                                  joiner: HotspotJoining,
+                                  aborting: Bool) async {
+        session.keepalive.cancel()
+        if aborting {
+            try? await send(.wifiShutdown)
+            try? await send(.wifiClose)
+        } else {
+            try? await send(.wifiClose)
+            try? await send(.wifiClose)
+        }
+        await joiner.leave()
+    }
+
+    /// Keeps the device's WiFi session alive for as long as it is open.
+    ///
+    /// `APP&WPING` used to cover exactly one stretch — the TCP connect — because
+    /// a session lasted exactly one transfer. A batch adds stretches the connect
+    /// pinger never saw: between one recording's `MCU&OFF` and the next one's
+    /// selection, and across the integrity check and file publish. This task
+    /// spans the whole session instead.
+    ///
+    /// It reads `ActivityMonitor.idleSince()` — the clock the TCP reader already
+    /// touches on every chunk — rather than timing itself, so a ping goes out
+    /// only after `pingInterval` of genuine silence. That is the point: nothing
+    /// pings on top of a transfer that is streaming bytes, which is what the
+    /// single-transfer code was careful never to do.
+    ///
+    /// Sends via `sendWiFiSessionKeepalive` (fire-and-forget) and never
+    /// `request`, so it cannot hold the session's single request slot — see that
+    /// method for why a `.busy` here would be actively misleading.
+    private func startWiFiSessionKeepalive(_ activity: ActivityMonitor,
+                                           readiness: WiFiReadiness) -> Task<Void, Never> {
+        Task { [weak self] in
+            // Check often enough to notice an idle gap promptly, never hot: a
+            // `pingInterval` of zero (tests use it to force pings) must not
+            // become a spin loop.
+            let tick = max(min(readiness.pingInterval, .seconds(1)), .milliseconds(50))
+            while !Task.isCancelled {
+                try? await Task.sleep(for: tick)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                guard activity.idleSince() >= readiness.pingInterval else { continue }
+                await self.sendWiFiSessionKeepalive()
+                activity.touch()
+            }
         }
     }
 
@@ -661,6 +801,55 @@ extension PocketSession {
         return false
     }
 
+    /// After a teardown, waits for the device to report its WiFi actually **off**
+    /// before the next `APP&WIFIO` starts it again.
+    ///
+    /// A batch restart is the only place in this protocol that closes an access
+    /// point and immediately reopens one, so it is the only place that can ask a
+    /// device to start an AP that has not finished coming down. Whether that
+    /// matters is unobserved — but the fallback is precisely what has to be
+    /// trustworthy when this meets hardware: a restart that half-works would be
+    /// read as the device refusing session reuse, which is the one thing the run
+    /// is trying to measure.
+    ///
+    /// Evidence, not a guessed sleep. `APP&WIFIS` is already this sequence's state
+    /// oracle, and the device is quick with it — a poll 114 ms after `APP&WIFIO`
+    /// already reads `3` (`docs/protocol/ble-protocol.md`, Wi-Fi Quick Transfer
+    /// step 4) — so waiting for the state it reports costs almost nothing when all
+    /// is well. Bounded by `readiness.timeout`, capped at
+    /// `WiFiReadiness.maximumAccessPointOffWait`.
+    ///
+    /// On expiry it **throws**, naming the last state seen, rather than pressing
+    /// on into a state it cannot describe. The caller reports that as the reason
+    /// the batch stopped, and no second `APP&WIFIO` is sent.
+    private func awaitWiFiOff(_ readiness: WiFiReadiness) async throws {
+        let bound = min(readiness.timeout, WiFiReadiness.maximumAccessPointOffWait)
+        let clock = ContinuousClock()
+        let deadline = clock.now + bound
+        var lastSeen = "no answer to APP&WIFIS"
+        repeat {
+            try Task.checkCancellation()
+            guard isAuthenticated else { throw PocketError.notAuthenticated }
+            // The per-poll timeout cannot outlive the overall bound, or a single
+            // silent poll would overshoot it.
+            let response = try? await request(.wifiStatus, timeout: min(.seconds(2), bound)) {
+                if case .wifiState = $0 { true } else { false }
+            }
+            if case .wifiState(let state)? = response {
+                if state == .off { return }   // the AP is down; safe to start it again
+                lastSeen = "MCU&WIFIS&\(state.rawValue)"
+            }
+            try? await Task.sleep(for: readiness.pollInterval)
+        } while clock.now < deadline
+        try Task.checkCancellation()   // a cancelled caller gets CancellationError
+        throw PocketError.transferFailed(
+            "the device did not report its WiFi off (MCU&WIFIS&0) within \(bound) of APP&WIFIC "
+            + "— last state: \(lastSeen). Refusing to send APP&WIFIO on top of an access point "
+            + "that may still be coming down, because a restart that half-works would look like "
+            + "the device refusing to serve a second recording, which is exactly what this run "
+            + "is trying to establish.")
+    }
+
     /// Opens the TCP connection while keeping the BLE link alive with
     /// `APP&WPING` keepalives — the capture's cadence for the stretch where
     /// the phone-side stack does DHCP and connects (~24 s there).
@@ -672,6 +861,7 @@ extension PocketSession {
     func connectKeepingLinkAlive(
         to endpoint: Network.NWEndpoint,
         readiness: WiFiReadiness,
+        sessionActivity: ActivityMonitor? = nil,
         connect: @escaping @Sendable (Network.NWEndpoint, Duration) async throws -> NWConnection
             = { try await TCPFetch.connect(to: $0, timeout: $1) }
     ) async throws -> NWConnection {
@@ -683,7 +873,12 @@ extension PocketSession {
                 while !Task.isCancelled {
                     try? await Task.sleep(for: readiness.pingInterval)
                     if Task.isCancelled { break }
+                    // Touched around the ping so the session keepalive — which
+                    // fires only on `pingInterval` of silence — stays off the
+                    // wire while this one is already covering the gap.
+                    sessionActivity?.touch()
                     _ = try? await self.request(.wifiKeepalive, timeout: .seconds(2)) { $0 == .pong }
+                    sessionActivity?.touch()
                 }
                 return nil
             }
@@ -692,49 +887,92 @@ extension PocketSession {
                 try Task.checkCancellation()
                 throw PocketError.transferFailed("wifi tcp connect never completed")
             }
+            sessionActivity?.touch()
             return connection
         }
     }
 
     /// The connected stretch: select the recording, reroute it to the
-    /// socket, read exactly the announced bytes into the sink, close, verify.
+    /// socket, read exactly the announced bytes into the sink, verify. The
+    /// session close (`APP&WIFIC` ×2) belongs to `closeWiFiSession`, because a
+    /// batch keeps the session open across several of these.
     private func transferOverTCP(_ recording: RecordingInfo,
                                  connection: NWConnection,
                                  sink: TransferSink,
+                                 sessionActivity: ActivityMonitor?,
                                  idleTimeout: Duration,
                                  onProgress: (@Sendable (Double) -> Void)?) async throws -> Data? {
-        // One confirmation poll, as the official app does once its TCP
-        // connect succeeds (the device answers MCU&WIFIS&1). Lenient: the
-        // open socket is the ground truth, so the answer is observational.
-        _ = try? await request(.wifiStatus, timeout: .seconds(2)) {
-            if case .wifiState = $0 { true } else { false }
-        }
-
-        // 7a. Select the recording — the same frame as a BLE download, and
-        // the device may briefly restart BLE bulk for it (the capture shows
-        // ~15 KB of leakage). No bulk sink is installed on this path, so
-        // those notifications are discarded, never mixed into the file.
-        let sizeResponse = try await request(.download(recording.id), timeout: .seconds(30)) {
-            if case .transferSize = $0 { true } else { false }
-        }
-        guard case .transferSize(let announced) = sizeResponse else {
-            throw PocketError.unexpectedResponse("expected MCU&U&<size>")
-        }
+        await confirmWiFiTCPConnected(sessionActivity)
+        let announced = try await selectRecordingOverWiFi(recording, sessionActivity: sessionActivity)
         // Same guard as the BLE path: a 0-byte recording must fail fast and
         // truthfully — before the device is told to serve it over the socket.
         guard announced > 0 else { throw PocketError.emptyRecording }
+        try await rerouteSelectionToWiFi(sessionActivity)
+        try await fetchOverTCP(connection: connection, expected: announced, sink: sink,
+                               sessionActivity: sessionActivity, idleTimeout: idleTimeout,
+                               onProgress: onProgress)
+        // A cancelled caller gets CancellationError, not a bogus size error.
+        try Task.checkCancellation()
+        // Integrity rules are identical to BLE by construction — exact byte
+        // count + FF F3 sync live in the shared sink, which also publishes a
+        // file destination only now, after both checks pass.
+        let data = try sink.finalize(announced: announced)
+        sessionActivity?.touch()
+        onProgress?(1.0)
+        return data
+    }
 
-        // 7b. APP&U&WIFI is a modifier on the selection above: it reroutes
-        // the in-progress upload to the TCP socket. The MCU&U&WIFI ack can
-        // lag (~1.2 s in the capture); the repeated MCU&U&<size> that follows
-        // it arrives unarmed and surfaces as an observational event.
+    /// One confirmation poll, as the official app does once its TCP connect
+    /// succeeds (the device answers `MCU&WIFIS&1`). Lenient: the open socket is
+    /// the ground truth, so the answer is observational.
+    private func confirmWiFiTCPConnected(_ sessionActivity: ActivityMonitor?) async {
+        _ = try? await request(.wifiStatus, timeout: .seconds(2)) {
+            if case .wifiState = $0 { true } else { false }
+        }
+        sessionActivity?.touch()
+    }
+
+    /// 7a. Select the recording — the same frame as a BLE download, and the
+    /// device may briefly restart BLE bulk for it (the capture shows ~15 KB of
+    /// leakage). No bulk sink is installed on this path, so those notifications
+    /// are discarded, never mixed into the file. Returns the announced length,
+    /// unvalidated: the caller decides what a 0 means (it is a fact about the
+    /// recording on a fresh session and ambiguous on a reused one).
+    private func selectRecordingOverWiFi(_ recording: RecordingInfo,
+                                         sessionActivity: ActivityMonitor?) async throws -> Int {
+        sessionActivity?.touch()
+        let sizeResponse = try await request(.download(recording.id), timeout: .seconds(30)) {
+            if case .transferSize = $0 { true } else { false }
+        }
+        sessionActivity?.touch()
+        guard case .transferSize(let announced) = sizeResponse else {
+            throw PocketError.unexpectedResponse("expected MCU&U&<size>")
+        }
+        return announced
+    }
+
+    /// 7b. `APP&U&WIFI` is a modifier on the preceding selection: it reroutes
+    /// the in-progress upload to the TCP socket. The `MCU&U&WIFI` ack can lag
+    /// (~1.2 s in the capture); the repeated `MCU&U&<size>` that follows it
+    /// arrives unarmed and surfaces as an observational event.
+    private func rerouteSelectionToWiFi(_ sessionActivity: ActivityMonitor?) async throws {
         _ = try await request(.wifiDownload, timeout: .seconds(30)) { $0 == .wifiUploadAck }
+        sessionActivity?.touch()
+    }
 
+    /// Reads exactly `expected` bytes into the sink and surfaces any surplus.
+    private func fetchOverTCP(connection: NWConnection,
+                              expected: Int,
+                              sink: TransferSink,
+                              sessionActivity: ActivityMonitor?,
+                              idleTimeout: Duration,
+                              onProgress: (@Sendable (Double) -> Void)?) async throws {
         let received = try await TCPFetch.receive(on: connection,
-                                                  expected: announced,
-                                                  idleTimeout: idleTimeout,
-                                                  into: sink,
-                                                  onProgress: onProgress)
+                                                 expected: expected,
+                                                 idleTimeout: idleTimeout,
+                                                 into: sink,
+                                                 sessionActivity: sessionActivity,
+                                                 onProgress: onProgress)
         // Live hardware sends a short trailer past the announced length
         // (10 bytes observed; content not yet identified). The announced size
         // is authoritative — the BLE download of the same recording is
@@ -744,19 +982,544 @@ extension PocketSession {
             emitEvent(.wifiTrailerReceived(byteCount: received.surplusCount,
                                            preview: received.surplusPreview))
         }
+    }
+}
 
-        // 8. Sent twice, mirroring the vendor app's captured traffic; the
-        // device tolerates the redundant close.
-        try? await send(.wifiClose)
-        try? await send(.wifiClose)
+// MARK: - One access-point session for several recordings
 
-        // A cancelled caller gets CancellationError, not a bogus size error.
-        try Task.checkCancellation()
-        // Integrity rules are identical to BLE by construction — exact byte
-        // count + FF F3 sync live in the shared sink, which also publishes a
-        // file destination only now, after both checks pass.
-        let data = try sink.finalize(announced: announced)
-        onProgress?(1.0)
-        return data
+/// Where a batched WiFi run puts each recording's payload.
+public enum WiFiBatchDestination: Sendable {
+    /// Each recording's bytes come back in its outcome's `data`. Convenient at
+    /// the device's observed sizes; a large backlog should prefer `.files`,
+    /// which never holds a whole recording in memory.
+    case memory
+    /// Each recording streams to the URL this returns, with the same file
+    /// guarantee as the single-recording streaming API: on ANY failure nothing
+    /// appears at the destination, and a pre-existing file there is replaced
+    /// only by a fully validated download. Outcomes carry no `data`.
+    case files(@Sendable (RecordingInfo) -> URL)
+}
+
+/// How one recording in a batch got its access point.
+///
+/// This is the batch's whole experiment in one value. Whether the device will
+/// serve a second `APP&U&<date>&<ts>` while its AP is still up has never been
+/// observed — the packet capture this protocol was decoded from covered a
+/// single-file sync — so a run attempts reuse and records what the device
+/// actually did.
+public enum WiFiSessionUse: Sendable, Equatable {
+    /// Opened the batch's first access-point session: the full
+    /// `APP&SHUT → APP&WIFIS → APP&WIFI → APP&WIFIO` handshake, the join, and
+    /// the association wait — about 6.5 s for the association alone.
+    case openedSession
+    /// Served by the session an earlier recording opened: no second join, no
+    /// second handshake. This is the saving the batch exists for, and observing
+    /// it on hardware is what would promote the capability out of `unverified`.
+    case reusedSession
+    /// Reuse was attempted and the device would not serve this recording on the
+    /// live session. The session was torn down properly and a fresh one opened
+    /// for this recording, so nothing was lost; `refusal` records what the
+    /// device did. After this the run stops attempting reuse — a doomed attempt
+    /// plus a teardown per recording would be *worse* than the
+    /// one-session-per-recording behaviour it falls back to.
+    case restartedSession(refusal: String)
+    /// Reuse had already been ruled out by an earlier `restartedSession`, so
+    /// this recording opened its own session without re-attempting it. Exactly
+    /// the behaviour of calling `downloadOverWiFi(_:)` once per recording.
+    case ownSession
+}
+
+/// What one recording's transfer produced inside a batch.
+public struct WiFiRecordingOutcome: Sendable, Equatable {
+    public let recording: RecordingInfo
+    public let sessionUse: WiFiSessionUse
+    /// Payload bytes delivered — the device's announced length, which the
+    /// integrity check proved was received exactly.
+    public let byteCount: Int
+    /// The payload, for a `.memory` destination; `nil` for `.files`, where the
+    /// bytes are already at their validated path.
+    public let data: Data?
+
+    public init(recording: RecordingInfo, sessionUse: WiFiSessionUse,
+                byteCount: Int, data: Data?) {
+        self.recording = recording
+        self.sessionUse = sessionUse
+        self.byteCount = byteCount
+        self.data = data
+    }
+}
+
+/// The recording a batch stopped on, and what it left untried.
+public struct WiFiBatchStop: Sendable, Equatable {
+    public let recording: RecordingInfo
+    /// One line naming the failure.
+    public let reason: String
+    /// The failure itself when it was one of this package's, so a caller can
+    /// branch on it — e.g. drop a `.emptyRecording` and re-batch the rest.
+    /// `nil` for anything else (a custom joiner's own error type, say).
+    public let error: PocketError?
+    /// The recordings after `recording`: never attempted, never touched.
+    /// Deciding what to do about them — a BLE retry, a later batch, nothing —
+    /// is the caller's call, which is why the run stops instead of guessing.
+    public let remaining: [RecordingInfo]
+
+    public init(recording: RecordingInfo, reason: String,
+                error: PocketError?, remaining: [RecordingInfo]) {
+        self.recording = recording
+        self.reason = reason
+        self.error = error
+        self.remaining = remaining
+    }
+}
+
+/// The result of one batched WiFi run.
+public struct WiFiBatchResult: Sendable, Equatable {
+    /// One entry per recording delivered, in the order requested. A run that
+    /// stops partway still reports these — a failure on recording 4 of 10 must
+    /// not lose 1–3.
+    public let delivered: [WiFiRecordingOutcome]
+    /// `nil` ⇔ every requested recording was delivered.
+    public let stopped: WiFiBatchStop?
+
+    public init(delivered: [WiFiRecordingOutcome], stopped: WiFiBatchStop?) {
+        self.delivered = delivered
+        self.stopped = stopped
+    }
+
+    public var isComplete: Bool { stopped == nil }
+
+    /// True when at least one recording rode a session another recording had
+    /// already opened — i.e. the device DID serve a second selection on a live
+    /// access point. This is the answer to the open question, read off a real
+    /// run rather than assumed.
+    public var didReuseSession: Bool {
+        delivered.contains { $0.sessionUse == .reusedSession }
+    }
+
+    /// Every refusal observed, in order. Non-empty means the device declined to
+    /// serve a recording on a live session and the run fell back to one session
+    /// per recording. Worth recording in the protocol reference either way.
+    public var refusals: [String] {
+        delivered.compactMap {
+            if case .restartedSession(let refusal) = $0.sessionUse { refusal } else { nil }
+        }
+    }
+
+    /// How many access-point sessions the *delivered* recordings needed. `1`
+    /// with several recordings delivered is the win; `delivered.count` is the
+    /// fallback. Counted over `delivered` only — a session opened for the
+    /// recording the run stopped on is not included, because that recording
+    /// produced no outcome.
+    public var sessionsOpened: Int {
+        delivered.filter { $0.sessionUse != .reusedSession }.count
+    }
+
+    /// One line for a log or a harness transcript.
+    public var summary: String {
+        let head = "\(delivered.count) recording(s) delivered over \(sessionsOpened) "
+            + "access-point session(s)"
+        let reuse = didReuseSession
+            ? " — the device DID serve a second selection on a live session"
+            : (refusals.isEmpty
+                ? ""
+                : " — the device refused a second selection: \(refusals[0])")
+        guard let stopped else { return head + reuse }
+        return head + reuse + "; stopped on \(stopped.recording.id.timestamp): \(stopped.reason)"
+    }
+}
+
+/// One line naming a failure, for a batch report a caller may log or print.
+/// The string-carrying `PocketError` cases already hold a sentence, so their
+/// detail is used verbatim; the rest get prose here rather than an enum dump.
+/// Exhaustive on purpose — a new `PocketError` case must be given a sentence.
+func wifiFailureText(_ error: Error) -> String {
+    guard let pocket = error as? PocketError else { return String(describing: error) }
+    switch pocket {
+    case .transferFailed(let detail):     return detail
+    case .wifiJoinFailed(let detail):     return "could not join the device's WiFi AP: \(detail)"
+    case .unexpectedResponse(let detail): return "protocol drift: \(detail)"
+    case .busy(let what):                 return what
+    case .emptyRecording:
+        return "the device announced 0 bytes for this recording (MCU&U&0)"
+    case .timeout(let command):
+        return "no reply matching what this client expects for \(command.wireFormat)"
+    case .unknownCommand(let command):
+        return "the device answered MCU&UNKNOWN to \(command.wireFormat)"
+    case .sizeMismatch(let expected, let received):
+        return "received \(received) of \(expected) announced bytes"
+    case .notMP3:
+        return "the payload did not start with an MP3 frame header"
+    case .notAuthenticated:
+        return "the BLE session is no longer authenticated"
+    case .disconnected:
+        return "the BLE link dropped"
+    case .authRejected:
+        return "the device rejected the session key"
+    case .deviceNotFound(let identifier):
+        return "this system does not know peripheral \(identifier)"
+    }
+}
+
+extension PocketSession {
+    /// Transfers several recordings over **one** access-point session: the AP
+    /// comes up once, every recording is fetched, and it closes once.
+    ///
+    /// **Why this exists.** A session is not cheap.
+    /// `APP&SHUT → APP&WIFIS → APP&WIFI → APP&WIFIO`, the join, and the
+    /// association wait cost about 6.5 s for the association alone, and on iOS
+    /// `NEHotspotConfiguration.joinOnce` makes the OS discard the configuration
+    /// when the phone disassociates — so a ten-recording sync done one session
+    /// at a time asks the person to join the network **ten times** and pays the
+    /// handshake ten times. Watched happening on hardware, 2026-07-29, across
+    /// ~354 MB in 30–50 MB files.
+    ///
+    /// **The reuse itself is `unverified`.** Nobody has ever issued a second
+    /// `APP&U&<date>&<ts>` while the AP was still up: the capture this protocol
+    /// was decoded from covered a single-file sync, so the device may serve a
+    /// second selection, refuse it, or do something else. This function
+    /// therefore *attempts* reuse and falls back cleanly. The moment the device
+    /// will not serve a recording on the live session — and that is always
+    /// decided **before** a single payload byte of it has flowed, which is what
+    /// makes a restart safe — the session is torn down properly (`APP&SHUT` +
+    /// `APP&WIFIC`, then leave the network) and a fresh one is opened for that
+    /// recording; reuse is not attempted again in the run. The worst case is
+    /// therefore exactly the one-session-per-recording behaviour of
+    /// `downloadOverWiFi(_:)`, never a wedged device or a half-open AP.
+    /// `WiFiBatchResult.didReuseSession` and `.refusals` say which happened;
+    /// `pocket-cli sync-wifi` exists to run the experiment on hardware.
+    ///
+    /// **Partial progress is kept.** The run stops at the first recording it
+    /// cannot deliver and reports what it already delivered — a failure on
+    /// recording 4 of 10 must not lose 1–3 — leaving the rest untouched for the
+    /// caller to decide about. That is not an error, so it does not throw:
+    /// `WiFiBatchResult.stopped` carries the recording, the reason, and what was
+    /// left. It throws only for what makes the batch impossible
+    /// (`PocketError.busy` when another transfer holds the device's single
+    /// transfer engine, `PocketError.notAuthenticated` before the handshake) and
+    /// for caller cancellation.
+    ///
+    /// Every exit path closes the access point, cancellation included: a still-
+    /// broadcasting AP competes with BLE for the same 2.4 GHz radio. An empty
+    /// `recordings` array is a no-op that never touches the radio.
+    ///
+    /// Claims the same exclusive transfer slot as `downloadOverBLE`, the live
+    /// stream, and the single-recording WiFi path — for the whole batch.
+    public func downloadOverWiFi(
+        _ recordings: [RecordingInfo],
+        into destination: WiFiBatchDestination = .memory,
+        endpointOverride: Network.NWEndpoint? = nil,
+        joiner: HotspotJoining = SystemHotspotJoiner(),
+        idleTimeout: Duration = .seconds(10),
+        readiness: WiFiReadiness = WiFiReadiness(),
+        onProgress: (@Sendable (RecordingID, Double) -> Void)? = nil
+    ) async throws -> WiFiBatchResult {
+        guard !recordings.isEmpty else { return WiFiBatchResult(delivered: [], stopped: nil) }
+        try beginTransfer()
+        defer { endTransfer() }   // covers every exit path below
+        return try await runWiFiBatch(recordings, destination: destination,
+                                      endpointOverride: endpointOverride, joiner: joiner,
+                                      idleTimeout: idleTimeout, readiness: readiness,
+                                      onProgress: onProgress)
+    }
+
+    /// What one recording's attempt did. `refused` is the only case that is not
+    /// terminal: it means the LIVE session would not serve this recording, and
+    /// it is only ever produced before a payload byte flowed.
+    private enum WiFiAttempt {
+        case delivered(byteCount: Int, data: Data?)
+        case refused(String)
+        case failed(String, PocketError?)
+        case cancelled
+    }
+
+    private func runWiFiBatch(
+        _ recordings: [RecordingInfo],
+        destination: WiFiBatchDestination,
+        endpointOverride: Network.NWEndpoint?,
+        joiner: HotspotJoining,
+        idleTimeout: Duration,
+        readiness: WiFiReadiness,
+        onProgress: (@Sendable (RecordingID, Double) -> Void)?
+    ) async throws -> WiFiBatchResult {
+        var delivered: [WiFiRecordingOutcome] = []
+        var live: WiFiSessionHandle?
+        /// Set by the first refusal. From then on every recording opens and
+        /// closes its own session and reuse is never attempted again.
+        var reuseRuledOut = false
+
+        /// Set by the first actual teardown. Only a run that has already closed an
+        /// access point can ask the device to start one that is still coming down,
+        /// so only such a run waits for `MCU&WIFIS&0` first — the very first
+        /// session opens exactly as the capture-verified single-transfer path does,
+        /// with no extra frame.
+        var hasClosedASession = false
+
+        /// The single teardown path. Clearing `live` first makes it idempotent,
+        /// so no exit can close twice and none can forget.
+        func closeLive(aborting: Bool) async {
+            guard let session = live else { return }
+            live = nil
+            hasClosedASession = true
+            await closeWiFiSession(session, joiner: joiner, aborting: aborting)
+        }
+
+        /// Opens a session, first waiting out any access point this run already
+        /// closed. `awaitWiFiOff` throws when the device never reports itself off,
+        /// and that throw must reach the caller: pressing on would send
+        /// `APP&WIFIO` into a state nothing here can describe.
+        func openSession() async throws -> WiFiSessionHandle {
+            if hasClosedASession { try await awaitWiFiOff(readiness) }
+            return try await openWiFiSession(joiner: joiner, readiness: readiness)
+        }
+
+        func stopping(at index: Int, _ reason: String, _ error: PocketError?) -> WiFiBatchResult {
+            WiFiBatchResult(
+                delivered: delivered,
+                stopped: WiFiBatchStop(recording: recordings[index], reason: reason, error: error,
+                                       remaining: Array(recordings[(index + 1)...])))
+        }
+
+        do {
+            for (index, recording) in recordings.enumerated() {
+                if Task.isCancelled {
+                    await closeLive(aborting: true)
+                    throw CancellationError()
+                }
+
+                // Acquire a session. `live != nil` implies reuse is still on the
+                // table: the loop closes the session after every recording once
+                // it has been ruled out.
+                let session: WiFiSessionHandle
+                var use: WiFiSessionUse
+                if let existing = live {
+                    session = existing
+                    use = .reusedSession
+                } else {
+                    do {
+                        session = try await openSession()
+                    } catch is CancellationError {
+                        throw CancellationError()   // nothing open: openWiFiSession cleaned up
+                    } catch {
+                        return stopping(at: index, wifiFailureText(error), error as? PocketError)
+                    }
+                    live = session
+                    use = reuseRuledOut ? .ownSession : .openedSession
+                }
+
+                var attempt = await transferOneRecording(
+                    recording, on: session, reusingSession: use == .reusedSession,
+                    destination: destination, endpointOverride: endpointOverride,
+                    idleTimeout: idleTimeout, readiness: readiness, onProgress: onProgress)
+
+                // The unknown answering: the live session would not serve this
+                // recording. Tear it down properly and give the recording a
+                // fresh session — the pre-existing behaviour, and from here on
+                // the only behaviour.
+                if case .refused(let refusal) = attempt {
+                    reuseRuledOut = true
+                    await closeLive(aborting: true)
+                    use = .restartedSession(refusal: refusal)
+                    do {
+                        let fresh = try await openSession()
+                        live = fresh
+                        attempt = await transferOneRecording(
+                            recording, on: fresh, reusingSession: false,
+                            destination: destination, endpointOverride: endpointOverride,
+                            idleTimeout: idleTimeout, readiness: readiness, onProgress: onProgress)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        return stopping(at: index, wifiFailureText(error), error as? PocketError)
+                    }
+                }
+
+                switch attempt {
+                case .delivered(let byteCount, let data):
+                    delivered.append(WiFiRecordingOutcome(recording: recording, sessionUse: use,
+                                                          byteCount: byteCount, data: data))
+                case .failed(let reason, let error):
+                    await closeLive(aborting: true)
+                    return stopping(at: index, reason, error)
+                case .cancelled:
+                    await closeLive(aborting: true)
+                    throw CancellationError()
+                case .refused(let refusal):
+                    // Unreachable: a refusal is retried on a FRESH session
+                    // above, where setup failures come back as `.failed`.
+                    // Handled rather than trapped — a wedged AP is worse than
+                    // an odd error.
+                    await closeLive(aborting: true)
+                    return stopping(at: index,
+                                    "internal: unhandled access-point session refusal: \(refusal)",
+                                    nil)
+                }
+
+                // Once reuse is ruled out, each recording closes its own
+                // session — exactly what calling the single-recording API in a
+                // loop does.
+                if reuseRuledOut { await closeLive(aborting: false) }
+            }
+        } catch {
+            await closeLive(aborting: true)
+            throw error
+        }
+        await closeLive(aborting: false)
+        return WiFiBatchResult(delivered: delivered, stopped: nil)
+    }
+
+    /// One recording on an already-open session.
+    ///
+    /// The split that matters is between the setup phase — the state check, the
+    /// TCP connect, the selection, the reroute — and the payload phase. Nothing
+    /// of this recording has been read during setup, so a setup failure on a
+    /// REUSED session is the device declining a second selection and a clean
+    /// restart costs only time. From the first payload byte on, a failure is
+    /// this recording's transfer failing and the batch stops.
+    private func transferOneRecording(
+        _ recording: RecordingInfo,
+        on session: WiFiSessionHandle,
+        reusingSession: Bool,
+        destination: WiFiBatchDestination,
+        endpointOverride: Network.NWEndpoint?,
+        idleTimeout: Duration,
+        readiness: WiFiReadiness,
+        onProgress: (@Sendable (RecordingID, Double) -> Void)?
+    ) async -> WiFiAttempt {
+        // Is the session still there at all? The device is the only witness to
+        // its own AP, and its answer distinguishes the two ways reuse can die
+        // before anything is even attempted. Asked before anything is allocated,
+        // so a refusal here costs nothing but the round-trip.
+        if reusingSession, let state = await liveWiFiState(session) {
+            switch state {
+            case .off:
+                return .refused("the device reported its WiFi off (MCU&WIFIS&0) after the "
+                                + "previous recording — it closed the session itself")
+            case .accessPointUp:
+                return .refused("the device reports its AP up with no associated client "
+                                + "(MCU&WIFIS&3) — this host left the network between "
+                                + "recordings (iOS discards a joinOnce configuration on "
+                                + "disassociation)")
+            case .clientJoined, .tcpConnected:
+                break   // still associated; carry on
+            }
+        }
+
+        let sink: TransferSink
+        switch destination {
+        case .memory:
+            sink = TransferSink.memory()
+        case .files(let url):
+            do { sink = try TransferSink.file(destination: url(recording)) }
+            catch { return .failed(wifiFailureText(error), error as? PocketError) }
+        }
+
+        // The batch reports progress per recording; the transfer machinery below
+        // is shared with the single-recording path and takes a bare fraction.
+        let id = recording.id
+        let progress: (@Sendable (Double) -> Void)?
+        if let report = onProgress {
+            progress = { fraction in report(id, fraction) }
+        } else {
+            progress = nil
+        }
+
+        // A fresh TCP connection per recording: the device closes the socket at
+        // `MCU&OFF` (TCP FIN in the capture, at the same instant), so the previous
+        // one is spent. The AP and the association are what carry over, not the
+        // socket. Its own do/catch, not folded into the selection below, because
+        // from the moment it returns EVERY exit must cancel it — a refusal that
+        // left a socket open would leak one per recording.
+        let connection: NWConnection
+        do {
+            connection = try await connectKeepingLinkAlive(
+                to: endpointOverride ?? WiFiEndpoint.default, readiness: readiness,
+                sessionActivity: session.activity)
+        } catch is CancellationError {
+            sink.abort()
+            return .cancelled
+        } catch {
+            sink.abort()
+            let text = wifiFailureText(error)
+            return reusingSession
+                ? .refused("the device did not accept a second TCP connection on :8475 — it "
+                           + "stopped listening after the previous recording: \(text)")
+                : .failed(text, error as? PocketError)
+        }
+
+        let announced: Int
+        do {
+            await confirmWiFiTCPConnected(session.activity)
+            announced = try await selectRecordingOverWiFi(recording,
+                                                          sessionActivity: session.activity)
+        } catch is CancellationError {
+            connection.cancel(); sink.abort()
+            return .cancelled
+        } catch {
+            connection.cancel(); sink.abort()
+            let text = wifiFailureText(error)
+            return reusingSession
+                ? .refused("the device would not serve another recording on the live session: \(text)")
+                : .failed(text, error as? PocketError)
+        }
+
+        // A 0-byte announcement is a fact about the recording, not a refusal:
+        // 0-second recordings exist on hardware, and a fresh session would
+        // announce the same 0. It is admittedly ambiguous on a reused session —
+        // the device *could* be declining by announcing nothing — but treating
+        // it as a refusal would tear down a working session every time a
+        // genuinely empty recording turned up in a batch. Recorded as an open
+        // question in docs/protocol/ble-protocol.md.
+        guard announced > 0 else {
+            connection.cancel()
+            sink.abort()
+            return .failed(wifiFailureText(PocketError.emptyRecording), .emptyRecording)
+        }
+
+        do {
+            try await rerouteSelectionToWiFi(session.activity)
+        } catch is CancellationError {
+            connection.cancel(); sink.abort()
+            return .cancelled
+        } catch {
+            connection.cancel(); sink.abort()
+            let text = wifiFailureText(error)
+            return reusingSession
+                ? .refused("the device acked a second selection but would not reroute it to the "
+                           + "socket (APP&U&WIFI): \(text)")
+                : .failed(text, error as? PocketError)
+        }
+
+        // Payload phase. Past here the device is pushing this recording's bytes,
+        // so nothing is a reuse question any more.
+        do {
+            try await fetchOverTCP(connection: connection, expected: announced, sink: sink,
+                                   sessionActivity: session.activity, idleTimeout: idleTimeout,
+                                   onProgress: progress)
+            try Task.checkCancellation()
+            let data = try sink.finalize(announced: announced)
+            session.activity.touch()
+            progress?(1.0)
+            return .delivered(byteCount: announced, data: data)
+        } catch is CancellationError {
+            connection.cancel(); sink.abort()
+            return .cancelled
+        } catch {
+            connection.cancel(); sink.abort()
+            return .failed(wifiFailureText(error), error as? PocketError)
+        }
+    }
+
+    /// The device's own view of its WiFi state, or `nil` when it did not answer.
+    /// Silence is not evidence — a firmware that stops answering `APP&WIFIS`
+    /// must not be read as having closed the session — so the caller carries on
+    /// and lets the selection decide.
+    private func liveWiFiState(_ session: WiFiSessionHandle) async -> WiFiState? {
+        session.activity.touch()
+        let response = try? await request(.wifiStatus, timeout: .seconds(2)) {
+            if case .wifiState = $0 { true } else { false }
+        }
+        session.activity.touch()
+        guard case .wifiState(let state)? = response else { return nil }
+        return state
     }
 }

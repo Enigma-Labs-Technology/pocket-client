@@ -7,6 +7,10 @@ final class AsyncGate: @unchecked Sendable {
     private var opened = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    /// Whether `open()` has run — lets a handler gate on "has X happened yet"
+    /// without a second latch of its own.
+    var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return opened }
+
     func open() {
         lock.lock()
         opened = true

@@ -136,6 +136,36 @@ public actor PocketDevice {
                                                           onProgress: onProgress) })
     }
 
+    /// Transfers several recordings over **one** access-point session instead of
+    /// one session per recording — see
+    /// `PocketSession.downloadOverWiFi(_:into:endpointOverride:joiner:idleTimeout:readiness:onProgress:)`
+    /// for the full contract. Uses this device's joiner, so on macOS the
+    /// operator is asked to join the network once for the whole batch.
+    ///
+    /// **`unverified`:** whether the device will serve a second
+    /// `APP&U&<date>&<ts>` while its AP is still up has never been observed on
+    /// hardware. The run attempts it and falls back to one session per recording
+    /// the moment the device refuses, so the worst case is exactly what calling
+    /// `download(_:via: .wifi)` in a loop does today.
+    /// `WiFiBatchResult.didReuseSession` says which happened.
+    ///
+    /// WiFi only, and deliberately: there is no BLE fallback and no `.auto`
+    /// here. A batch exists to avoid repeating the AP handshake, which BLE does
+    /// not have, and silently syncing 350 MB over a ~35 KB/s link is not a
+    /// fallback anyone would choose on the caller's behalf. Read
+    /// `WiFiBatchResult.stopped` and decide.
+    public func downloadOverWiFi(
+        _ recordings: [RecordingInfo],
+        into destination: WiFiBatchDestination = .memory,
+        idleTimeout: Duration = .seconds(10),
+        readiness: WiFiReadiness = WiFiReadiness(),
+        onProgress: (@Sendable (RecordingID, Double) -> Void)? = nil
+    ) async throws -> WiFiBatchResult {
+        try await session.downloadOverWiFi(recordings, into: destination, joiner: joiner,
+                                           idleTimeout: idleTimeout, readiness: readiness,
+                                           onProgress: onProgress)
+    }
+
     /// The `.auto` routing policy both download shapes share — one place, so
     /// the fallback rules cannot drift: WiFi first when the mode resolves
     /// there, degrading to BLE only for `.auto`, and never for caller

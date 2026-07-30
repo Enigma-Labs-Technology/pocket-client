@@ -12,6 +12,7 @@
 //   swift run pocket-cli connect <uuid>             — targeted connect by identifier, then status
 //   swift run pocket-cli list                       — dates + recordings
 //   swift run pocket-cli download <date> <ts> [ble|wifi]
+//   swift run pocket-cli sync-wifi <date> [count]   — N recordings, ONE access-point session
 //   swift run pocket-cli record [start|stop|pause|resume]
 //   swift run pocket-cli listen [seconds]           — live MP3 to live.mp3
 //   swift run pocket-cli raw WIFIS --listen 20      — one allowlisted probe, print all replies
@@ -38,6 +39,16 @@ subcommands:
                                     authenticate, print device status
   list                              recording dates and files
   download <date> <ts> [ble|wifi]   fetch one recording to <ts>.mp3 (default ble)
+  sync-wifi <date> [count]          fetch the first <count> recordings of <date> (default 3)
+                                    over ONE access-point session instead of one per
+                                    recording, and report per recording whether the
+                                    session was REUSED or had to be RESTARTED. That
+                                    report is the experiment: nobody has ever issued a
+                                    second APP&U&<date>&<ts> while the AP was still up,
+                                    so the run attempts it and falls back to one session
+                                    per recording the moment the device refuses. On this
+                                    Mac you should be asked to join the network once if
+                                    reuse works, and once per recording if it does not.
   record [start|stop|pause|resume]  recording control (default start)
   listen [seconds]                  capture live MP3 to live.mp3 (default 10 s)
   raw <VERB> [args…] [--listen <seconds>]
@@ -488,6 +499,10 @@ var targetIdentifier: UUID?
 /// deterministically). Nil means generate one.
 var adoptKey: String?
 
+/// Set by the `sync-wifi` validation below: how many of the day's recordings to
+/// pull in one access-point session.
+var syncWiFiCount = 3
+
 switch subcommand {
 case "help", "--help", "-h":
     print(usageText)
@@ -539,6 +554,16 @@ case "download":
     guard arguments.count >= 3 else { usageError("download needs <date> <timestamp>") }
     if arguments.count >= 4, !["ble", "wifi"].contains(arguments[3]) {
         usageError("transfer mode must be ble or wifi, not '\(arguments[3])'")
+    }
+case "sync-wifi":
+    guard arguments.count >= 2 else {
+        usageError("sync-wifi needs a date — run `pocket-cli list` to see which dates exist")
+    }
+    if arguments.count >= 3 {
+        guard let parsed = Int(arguments[2]), parsed >= 1 else {
+            usageError("sync-wifi count must be a positive integer, not '\(arguments[2])'")
+        }
+        syncWiFiCount = parsed
     }
 case "record":
     let verb = arguments.count >= 2 ? arguments[1] : "start"
@@ -730,6 +755,9 @@ do {
         print("wrote \(out.path): \(byteCount) bytes in \(elapsedMS) ms " +
               "(\(String(format: "%.1f", rate)) KB/s)")
         print("first bytes: \(hexPrefix(firstBytes))  (expect FF F3 48 C4 — 32 kbps mono MP3 sync)")
+
+    case "sync-wifi":
+        try await runWiFiBatchSync(device: device, date: arguments[1], count: syncWiFiCount)
 
     case "record":
         switch arguments.count >= 2 ? arguments[1] : "start" {

@@ -15,6 +15,79 @@ notes for a release before upgrading.
 
 ### Added
 
+- **One Wi-Fi access-point session for a whole sync, instead of one per
+  recording — the reuse itself `unverified`.** `PocketSession` and `PocketDevice`
+  gained `downloadOverWiFi(_ recordings:into:…)`, which brings the access point up
+  once, transfers N recordings, and closes it once. The existing
+  single-recording API is unchanged; this is purely additive.
+
+  The problem it addresses was watched on hardware on 2026-07-29: because a
+  session lasts exactly one transfer and `NEHotspotConfiguration.joinOnce` makes
+  iOS discard the configuration on disassociation, a ten-recording sync (~354 MB
+  in 30–50 MB files) asked the operator to join the network **ten times** and paid
+  the `SHUT → WIFIS → WIFI → WIFIO` handshake plus the ~6.5 s association wait ten
+  times.
+
+  **The device's part of this is genuinely unknown and the API says so.** Nobody
+  has ever issued a second `APP&U&<date>&<ts>` while the access point was still
+  up — the packet capture the protocol was decoded from covered a single-file sync
+  — so the run *attempts* reuse and falls back cleanly. A refusal is always
+  detected **before** a payload byte of the affected recording has flowed (the
+  `APP&WIFIS` gap poll reporting `0` or `3`, a TCP connect the device will not
+  accept, a selection it will not answer, a reroute it will not ack); the session
+  is then torn down properly — `APP&SHUT` + `APP&WIFIC`, then leave the network —
+  and a fresh one is opened for that recording, after which reuse is not attempted
+  again in that run. **The worst case is therefore exactly the previous
+  one-session-per-recording behaviour**, never a wedged device or a half-open
+  access point. `WiFiBatchResult.didReuseSession` and `.refusals` report which
+  happened. Both branches are unit-tested against a fake device; neither has run
+  against hardware, which is what the new `unverified` grade in the README's
+  claim table means.
+
+  **A restart waits for the access point to actually be off.** A restart is the
+  only place in this protocol that closes an AP and immediately reopens one, so
+  before every reopen (never before the first session) the client polls
+  `APP&WIFIS` until it reports `MCU&WIFIS&0` — evidence rather than a guessed
+  sleep, using the state oracle this sequence already relies on, and one extra
+  round-trip against a device that reports transitions in ~100 ms. The wait is
+  bounded, and **on expiry the run stops and names the last state seen instead of
+  sending `APP&WIFIO`** onto an access point that may still be coming down. The
+  fallback is what has to be trustworthy for the hardware experiment to mean
+  anything: a restart that half-works would be misread as the device refusing
+  session reuse.
+
+  Partial progress is kept and is not an error: the run stops at the first
+  recording it cannot deliver — a failure on recording 4 of 10 must not lose 1–3 —
+  and returns `WiFiBatchResult.stopped` naming the recording, the reason, the
+  `PocketError` when it was one, and the recordings it never attempted. It throws
+  only for `PocketError.busy` and caller cancellation. Every exit path closes the
+  access point, cancellation included, because one left broadcasting competes with
+  BLE for the same 2.4 GHz radio. Wi-Fi only by design: no `.auto`, no BLE
+  fallback — a batch exists to avoid an AP handshake BLE does not have, and
+  pushing 350 MB down a ~35 KB/s link is not a choice to make for the caller.
+
+  **`APP&WPING` now spans the whole session** rather than just the TCP connect,
+  gated on the idle clock the TCP reader already touches, so a ping goes out only
+  after real silence and never on top of a transfer that is streaming bytes. It is
+  fire-and-forget rather than a request: the session allows one armed waiter, and a
+  keepalive holding it could fail the next `APP&U&<date>&<ts>` with `.busy`, which
+  a batch would misread as the device refusing a second selection. Its `MCU&WPING`
+  echo is absorbed the same way the 30 s `APP&BAT` keepalive's echo already was.
+
+  **`pocket-cli sync-wifi <date> [count]`** is the hardware experiment: it
+  transfers several recordings in one run and prints, per recording, whether the
+  session was `REUSED` or had to be `RESTARTED` (with the refusal verbatim), then a
+  verdict. Since the macOS join is manual, the run is its own control — one prompt
+  if reuse works, one per recording if it does not. The open question and every
+  refusal shape are recorded in
+  [the protocol reference](docs/protocol/ble-protocol.md).
+
+  One behaviour change on an existing path, from moving the session close out of
+  the transfer: a single-recording Wi-Fi transfer that fails its **integrity
+  check** (size mismatch, non-MP3) now sends `APP&SHUT` + one `APP&WIFIC` instead
+  of two `APP&WIFIC` followed by `APP&SHUT` + a third. The frame order of a
+  successful transfer, and of every other failure path, is unchanged.
+
 - **A rebind propagates to the Wi-Fi AP password — VERIFIED on hardware
   (2026-07-28).** The protocol reference said the AP password is the session
   key's first 8 characters but never said *when* it is derived, and nobody had
