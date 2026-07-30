@@ -314,7 +314,7 @@ opening the access point, which is most of what the rotation was for.
 Security note: SK is the root secret for both BLE auth and the Wi-Fi AP password —
 anyone holding SK can join the AP and pull every recording.
 
-### Reusing one AP session for several recordings (PARTIALLY ANSWERED on hardware, 2026-07-30)
+### Reusing one AP session for several recordings (VERIFIED on hardware, 2026-07-30)
 
 **The device does serve a second selection on a live access point, and the
 transfer over it then reset.** The first successful macOS Wi-Fi transfer,
@@ -336,11 +336,29 @@ second file, refuse, or do something worse" — is superseded. The device accept
 second TCP connection, accepted a second selection, and announced the length. It
 does **not** refuse reuse.
 
-What is still open is the reset. It arrived after the announcement and before the
-payload completed, and this one run cannot say whether it is device behaviour, a
-consequence of the socket the client opens, or something about the gap between
-`MCU&OFF` and the next connect. Until another run says otherwise the client treats
-it as something to fall back from rather than something to fix.
+**A later run on the same day completed both recordings over one session**, which
+promotes reuse from *served* to *works*:
+
+```
+[1/2] 20260104101500  100%   wrote 30282 bytes (announced 30282)
+MCU&OFF
+wifi tcp connect will require en0 …   ← a second connect, and no re-join
+MCU&WIFIS&1
+MCU&U&25242                           ← the second file's length
+[2/2] 20260104103000  100%   wrote 25242 bytes (announced 25242)
+MCU&OFF · MCU&WIFIC
+
+2 recording(s) delivered over 1 access-point session in 29.501 s
+```
+
+No second join, no second handshake, no reset. **Session reuse works on FW 1.7.**
+
+**The reset is unexplained, not fixed.** It happened once and did not recur, and
+nothing changed in between that touched it — the fallback added in response never
+fired in the successful run, because there was nothing to fall back from. Two runs,
+one each way, is not enough to call it transient with confidence. Treat a mid-stream
+reset as something that can still happen and must never cost a recording, and if you
+see one, the transcript is worth recording here.
 
 **The reset must never cost a recording.** In the run above it did: the batch
 stopped with one of two recordings delivered, because only a refusal observed
@@ -616,7 +634,7 @@ answer this one, because everything it does happens downstream of a join.
 2. ~~**Will the device serve a second `APP&U&<date>&<ts>` while its access point
    is still up?**~~ **ANSWERED 2026-07-30: yes.** It accepted a second TCP
    connection with no re-join and announced the next file's length — see
-   [Reusing one AP session for several recordings](#reusing-one-ap-session-for-several-recordings-partially-answered-on-hardware-2026-07-30).
+   [Reusing one AP session for several recordings](#reusing-one-ap-session-for-several-recordings-verified-on-hardware-2026-07-30).
    **What replaces it: why did the transfer over that reused session reset
    (`ECONNRESET`) after the announcement?** One observation, so nothing is settled:
    it may be device behaviour to fall back from, or this client's socket handling.

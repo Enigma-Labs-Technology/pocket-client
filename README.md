@@ -779,8 +779,8 @@ any upload command, so it does not mean "transferring".
 
 ### One access-point session for a whole sync
 
-**Evidence:** `hardware` for the device serving a second selection (2026-07-30);
-`unverified` for reuse actually completing a transfer. The batch mechanics —
+**Evidence:** `hardware` — two recordings delivered over one access-point session
+on 2026-07-30, no second join and no second handshake. The batch mechanics —
 including the fallback from a reuse that breaks mid-stream — are unit-tested
 against a fake device on every branch below.
 
@@ -815,20 +815,19 @@ result.sessionsOpened     // 1 is the win; delivered.count is the fallback
 > one session per recording** — today's behaviour — never a wedged device, a
 > half-open access point, or a truncated file.
 
-> [!WARNING]
-> **What hardware has settled, and what it has not.** On 2026-07-30 the device
-> *did* serve a second `APP&U&<date>&<ts>` on a live access point: a second TCP
-> connection with no re-join, and the next file's length announced. So it does not
-> refuse reuse. The stream then reset mid-transfer, so reuse does not yet *work*
-> either. Whether that reset is avoidable at all — this client's socket handling,
-> or device behaviour to fall back from — is one observation old and settles
-> nothing.
+> [!NOTE]
+> **What hardware settled, and the one thing it did not.** On 2026-07-30, FW 1.7
+> delivered two recordings over a single access-point session in 29.5 s — one
+> join, one handshake, the second file's length announced on the live session and
+> the transfer over it completed. Reuse works.
 >
-> The same run also showed why this needs saying: the batch stopped with one of
-> two recordings delivered, because only a refusal seen *before* the payload phase
-> triggered the fallback. That is fixed, and the guarantee above is what replaced
-> it. Run [`pocket-cli sync-wifi`](#sync-wifi--the-reuse-experiment) against your
-> own device and please record the transcript; the `session:` lines are the result.
+> An earlier run the same day reset mid-stream after the announcement, and that is
+> **unexplained rather than fixed**: nothing between the two runs touched the reset
+> path, and the fallback added in response never fired in the successful one
+> because there was nothing to fall back from. Two runs, one each way. Treat a
+> mid-stream reset as something that can still happen — which is what the
+> guarantee above is for — and if you see one, please record the transcript. The
+> sample for every claim here is one device on one firmware version.
 
 Five things to know:
 
