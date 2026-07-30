@@ -101,6 +101,13 @@ public actor PocketDevice {
     public func listRecordings(on date: String) async throws -> [RecordingInfo] {
         try await session.listRecordings(on: date)
     }
+    /// The validating front door to `listRecordings(on:)` for a date a **person**
+    /// supplied: a malformed one is refused before any frame is sent, and an
+    /// empty well-formed one is answered with the dates the device does have.
+    /// See `PocketSession.lookUpRecordings(forDate:)`.
+    public func lookUpRecordings(forDate raw: String) async throws -> RecordingLookup {
+        try await session.lookUpRecordings(forDate: raw)
+    }
     public func delete(_ id: RecordingID) async throws { try await session.delete(id) }
 
     /// Downloads into memory. Convenient at the device's observed sizes

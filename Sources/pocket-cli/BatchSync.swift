@@ -80,11 +80,26 @@ private func sessionUseLine(_ use: WiFiSessionUse) -> String {
 /// The device is already connected and authenticated; the caller owns the event
 /// printer, so unmatched frames and the TCP trailer still surface as usual.
 func runWiFiBatchSync(device: PocketDevice, date: String, count: Int) async throws {
-    let listed = try await timed("listRecordings \(date)") {
-        try await device.listRecordings(on: date)
+    // Through `lookUpRecordings`, never `listRecordings`: this call site is where
+    // `sync-wifi 20260728 2` reported "no recordings on 20260728" about a device
+    // holding eight of them. A malformed date is refused before a frame is sent,
+    // and an empty well-formed date is answered with the dates that DO exist —
+    // one extra round trip on a path that is about to open an access point.
+    let lookup = try await timed("lookUpRecordings \(date)") {
+        try await device.lookUpRecordings(forDate: date)
     }
-    guard !listed.isEmpty else {
-        print("no recordings on \(date) — nothing to sync (try `pocket-cli list`)")
+    let day: String
+    let listed: [RecordingInfo]
+    switch lookup {
+    case .found(let normalized, let recordings):
+        (day, listed) = (normalized, recordings)
+    case .empty(_, let explanation):
+        print(explanation)
+        return
+    case .refused(let reason):
+        // Unreachable via the CLI, which refuses the same argument before it
+        // connects; printed rather than assumed away.
+        print("error: \(reason)")
         return
     }
     let recordings = Array(listed.prefix(count))
@@ -95,7 +110,7 @@ func runWiFiBatchSync(device: PocketDevice, date: String, count: Int) async thro
 
     print("""
 
-    sync-wifi: \(recordings.count) of \(listed.count) recording(s) on \(date), \
+    sync-wifi: \(recordings.count) of \(listed.count) recording(s) on \(day), \
     \(totalSize) estimated,
       over ONE access-point session instead of one per recording.
 

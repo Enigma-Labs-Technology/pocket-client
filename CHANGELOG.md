@@ -42,6 +42,57 @@ notes for a release before upgrading.
 
 ### Fixed
 
+- **`pocket-cli` reported a date it could not parse as a fact about the
+  recorder.** On 2026-07-28, `pocket-cli sync-wifi 20260728 2` printed
+
+  ```
+  no recordings on 20260728 — nothing to sync (try `pocket-cli list`)
+  ```
+
+  against a device that had **eight** recordings that day. The argument went
+  straight onto the wire as `APP&LIST&20260728`; the recorder answers a directory
+  it does not recognise with an empty listing rather than an error, and the CLI
+  reported that empty listing as the device's inventory. It cost a hardware round,
+  and it is the dangerous failure mode: a plausible, confident, wrong answer that
+  sends somebody looking for a missing recording instead of at their command line.
+
+  Three changes, and the compact form is deliberately **not** one of the things
+  refused:
+
+  - **Malformed dates never reach the radio.** `download` and `sync-wifi` both
+    validate before Bluetooth is touched at all, and the refusal echoes what was
+    given and names the forms that work. `2026-1-4`, `2026/01/04` and
+    `2026-02-30` are all refused; a whole 14-digit recording ID is refused by
+    naming the date it visibly contains ("its date is 2026-01-04, the first 8
+    digits"), because taking a `list` output for a date is the likeliest way to
+    get here.
+  - **`20260104` is normalised to `2026-01-04`, not rejected.** It is exactly the
+    first eight characters of the recording IDs `pocket-cli list` prints, so
+    slicing a date off one is what a reasonable person does — and it is the
+    argument that produced the defect.
+  - **"No recordings on this date" and "the device has never heard of this date"
+    are now different sentences.** A well-formed date the device serves nothing
+    for costs one extra `APP&LIST_DIRS` (~89 ms on hardware, on a path that is
+    about to open an access point anyway) and is answered with the dates that do
+    have recordings, instead of with advice to go run another command. A device
+    that lists the date but serves no files for it, and a device with no dates at
+    all, each say so in their own terms.
+
+  The same silent-empty trap one level down is closed with it: `download` with a
+  timestamp that matches nothing now names the timestamps that day *does* have
+  and can no longer print a bare `device has: none` for a date the device simply
+  does not know. A timestamp is not validated by grammar and cannot be — hardware
+  has produced IDs like `PH260105143000` — so the day's own listing is the
+  authority, and it is printed.
+
+- **`RecordingDate` and `PocketSession`/`PocketDevice.lookUpRecordings(forDate:)`
+  are the API-side rule** (additive), returning `RecordingLookup.found` /
+  `.refused` / `.empty`. `listRecordings(on:)` is unchanged and stays
+  unvalidated on purpose: it also takes directories that came *from* the device,
+  and those are not always dates — a library that refused non-date directories
+  would make exactly those recordings unfetchable. Validation belongs where a
+  *person* typed the string, and that is where it is applied.
+
 - **A batch could deliver fewer recordings than transferring the same list one at
   a time would — the defect the first successful macOS Wi-Fi transfer exposed.**
   On 2026-07-30, `sync-wifi <date> 2` delivered recording 1 whole and then, on

@@ -40,6 +40,8 @@ subcommands:
                                     authenticate, print device status
   list                              recording dates and files
   download <date> <ts> [ble|wifi]   fetch one recording to <ts>.mp3 (default ble)
+                                    <date> is YYYY-MM-DD (2026-01-04) or the compact
+                                    YYYYMMDD (20260104) — see the note below
   sync-wifi <date> [count]          fetch the first <count> recordings of <date> (default 3)
                                     over ONE access-point session instead of one per
                                     recording, and report per recording whether the
@@ -88,6 +90,14 @@ subcommands:
                                     and clear its binding (APP&BLE&RESET). Requires the
                                     current key in POCKET_SK and the explicit flag; it
                                     refuses without the flag and touches nothing.
+
+dates (download, sync-wifi): YYYY-MM-DD as `list` prints it (2026-01-04), or the
+compact YYYYMMDD (20260104) — the first 8 characters of a recording ID, which is
+normalised rather than refused. Anything else is refused BEFORE the radio is
+touched, because the device answers a directory it does not recognise with an
+EMPTY LISTING rather than an error: an unchecked date comes back looking exactly
+like a day with no recordings. A well-formed date the device has nothing for is
+answered with the dates that do.
 
 POCKET_SK is the device's current 16-char session key. On a factory device that
 is the first 16 characters of the account's Firebase UID; after `adopt` it is the
@@ -518,6 +528,16 @@ var adoptKey: String?
 /// pull in one access-point session.
 var syncWiFiCount = 3
 
+/// Set by the `download` and `sync-wifi` validation below: the date argument
+/// **normalised** to the `YYYY-MM-DD` form the device's directories use, so a
+/// compact `20260104` becomes `2026-01-04` before it is ever put in a frame.
+///
+/// Every later use reads this, never `arguments[1]`. That is the point: the
+/// 2026-07-28 defect was the raw argument reaching the wire, where the device
+/// answers an unknown directory with an empty listing and the client reported
+/// that as "no recordings on your device".
+var dateArgument = ""
+
 /// Set by the `probe-ap-lifetime` validation below: the access-point lifetime
 /// experiment's cadence, cap, and whether it sends `APP&WPING`.
 var apLifetimeSettings = AccessPointLifetimeSettings()
@@ -571,12 +591,27 @@ case "connect":
     targetIdentifier = parsed
 case "download":
     guard arguments.count >= 3 else { usageError("download needs <date> <timestamp>") }
+    // Checked here, where nothing has been touched yet — not even Bluetooth.
+    // A date the device cannot parse used to go straight onto the wire and come
+    // back as an empty listing, which the CLI then reported as a fact about the
+    // recorder. `RecordingDate` owns the grammar and the message.
+    switch RecordingDate.normalize(arguments[1]) {
+    case .date(let normalized): dateArgument = normalized
+    case .refused(let reason):  usageError(reason)
+    }
+    guard !arguments[2].trimmingCharacters(in: .whitespaces).isEmpty else {
+        usageError("download needs a recording timestamp — `pocket-cli list` prints them")
+    }
     if arguments.count >= 4, !["ble", "wifi"].contains(arguments[3]) {
         usageError("transfer mode must be ble or wifi, not '\(arguments[3])'")
     }
 case "sync-wifi":
     guard arguments.count >= 2 else {
         usageError("sync-wifi needs a date — run `pocket-cli list` to see which dates exist")
+    }
+    switch RecordingDate.normalize(arguments[1]) {
+    case .date(let normalized): dateArgument = normalized
+    case .refused(let reason):  usageError(reason)
     }
     if arguments.count >= 3 {
         guard let parsed = Int(arguments[2]), parsed >= 1 else {
@@ -747,15 +782,35 @@ do {
         }
 
     case "download":
-        let id = RecordingID(date: arguments[1], timestamp: arguments[2])
+        let id = RecordingID(date: dateArgument, timestamp: arguments[2])
         let mode: TransferMode = (arguments.count >= 4 && arguments[3] == "wifi") ? .wifi : .ble
-        // Duration is needed for size estimates; probe the real value from the day's list.
-        let listed = try await timed("listRecordings \(id.date)") {
-            try await device.listRecordings(on: id.date)
+        // Duration is needed for size estimates; probe the real value from the
+        // day's list — through the validating lookup, so an empty day is
+        // reported as the device's own inventory instead of as a bare "none",
+        // which reads as "your device has nothing" when it may only mean "that
+        // is not a date this device has".
+        let lookup = try await timed("lookUpRecordings \(dateArgument)") {
+            try await device.lookUpRecordings(forDate: dateArgument)
+        }
+        let listed: [RecordingInfo]
+        switch lookup {
+        case .found(_, let recordings):
+            listed = recordings
+        case .empty(_, let explanation):
+            print(explanation)
+            await device.disconnect()
+            exit(1)
+        case .refused(let reason):
+            // Unreachable — the identical check ran before the radio. Kept
+            // because the library owns the rule, and a CLI that quietly assumed
+            // otherwise is how the rule stops holding.
+            print("error: \(reason)")
+            await device.disconnect()
+            exit(2)
         }
         guard let recording = listed.first(where: { $0.id == id }) else {
-            print("no such recording \(id.timestamp) on \(id.date); device has: " +
-                  (listed.isEmpty ? "none" : listed.map(\.id.timestamp).joined(separator: ", ")))
+            print(RecordingDate.noSuchRecordingText(timestamp: id.timestamp, date: id.date,
+                                                    onThatDate: listed))
             await device.disconnect()
             exit(1)
         }
@@ -787,7 +842,7 @@ do {
         print("first bytes: \(hexPrefix(firstBytes))  (expect FF F3 48 C4 — 32 kbps mono MP3 sync)")
 
     case "sync-wifi":
-        try await runWiFiBatchSync(device: device, date: arguments[1], count: syncWiFiCount)
+        try await runWiFiBatchSync(device: device, date: dateArgument, count: syncWiFiCount)
 
     case "probe-ap-lifetime":
         try await runAccessPointLifetimeProbe(device: device, settings: apLifetimeSettings)

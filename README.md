@@ -1758,8 +1758,8 @@ With no subcommand it runs `probe`.
 | `probe` | — | Scan, connect, print GATT diagnostics, authenticate, print full status (7 round trips, timed). | required |
 | `connect` | `<identifier>` | Same as `probe` but connects to exactly one peripheral identifier — no scan, no fallback. Validates the UUID before touching the radio. | required |
 | `list` | — | Dates, then recordings per date, with duration and estimated size. Each call timed. | required |
-| `download` | `<date> <ts> [ble\|wifi]` (default `ble`) | Looks the recording up in the day's listing (for its duration), streams it to `<ts>.mp3`, then reads the file back to report true size, KB/s, and its first four bytes for the `FF F3 48 C4` eyeball check. | required |
-| `sync-wifi` | `<date> [count]` (default 3) | Streams the day's first `count` recordings to `<ts>.mp3` over **one** access-point session, printing per recording whether the session was `REUSED` or had to be `RESTARTED`, then a verdict. See [`sync-wifi`](#sync-wifi--the-reuse-experiment). | required |
+| `download` | `<date> <ts> [ble\|wifi]` (default `ble`) | Validates the date before the radio (see [date arguments](#date-arguments)), looks the recording up in the day's listing (for its duration), streams it to `<ts>.mp3`, then reads the file back to report true size, KB/s, and its first four bytes for the `FF F3 48 C4` eyeball check. An unmatched timestamp is answered with the ones that day *does* have. | required |
+| `sync-wifi` | `<date> [count]` (default 3) | Validates the date before the radio (see [date arguments](#date-arguments)), then streams the day's first `count` recordings to `<ts>.mp3` over **one** access-point session, printing per recording whether the session was `REUSED` or had to be `RESTARTED`, then a verdict. See [`sync-wifi`](#sync-wifi--the-reuse-experiment). | required |
 | `probe-ap-lifetime` | `[--keepalive] [--cap <s>] [--poll <s>] [--ping <s>]` (defaults: no keepalive, 180 s cap, 1 s polls, 10 s pings) | Brings the access point up and times how long the device keeps it, polling `APP&WIFIS` and printing every state with its elapsed time. **Joins nothing.** `--keepalive` sends `APP&WPING` meanwhile: run it both ways and the difference is the answer. See [`probe-ap-lifetime`](#probe-ap-lifetime--does-appwping-extend-the-access-point). | required |
 | `record` | `[start\|stop\|pause\|resume]` (default `start`) | `start` prints the new `RecordingID`; `stop` stops. `pause`/`resume` connect, then print the firmware verdict — neither frame is ever sent. | required |
 | `listen` | `[seconds]` (default 10) | Captures live audio to `live.mp3`, reporting time-to-first-chunk and chunk count. | required |
@@ -1767,6 +1767,43 @@ With no subcommand it runs `probe`.
 | `probe-unverified` | — | Sends `APP&PAU` then `APP&RESU` and prints exactly what the device answers, with an honest verdict per command. | required |
 | `adopt` | `[key]` | Binds a self-generated (or supplied) 16-character key to an **unbound** device, then proves it persisted. | not needed |
 | `reset` | `--wipe-all-recordings` | **Destroys every recording** and clears the binding. | required |
+
+### Date arguments
+
+`download` and `sync-wifi` take a date, and it is checked **before anything is
+sent** — before Bluetooth is touched at all. Two forms are accepted:
+
+| You type | Sent as | Why |
+|---|---|---|
+| `2026-01-04` | `2026-01-04` | The form `pocket-cli list` prints. |
+| `20260104` | `2026-01-04` | The first 8 characters of a recording ID, which is where people get it. Normalised, not refused. |
+
+Anything else is refused by name, with both forms in the message and nothing sent
+— `2026-1-4`, `2026/01/04`, `2026-02-30`, and a whole 14-digit recording ID
+(which is answered with the date it contains: *"'20260104101500' is a recording
+timestamp, not a date — its date is 2026-01-04, the first 8 digits"*).
+
+**This is load-bearing, not politeness.** The recorder answers a directory it
+does not recognise with an empty listing rather than an error, so an unchecked
+date comes back looking exactly like a day with no recordings. On 2026-07-28
+`sync-wifi 20260728 2` printed `no recordings on 20260728 — nothing to sync`
+against a device holding eight recordings from that day.
+
+A **well-formed** date the device has nothing for costs one extra
+`APP&LIST_DIRS` (~89 ms) and is answered with the device's own inventory, because
+three different things used to print as the same sentence:
+
+| The device says | You get |
+|---|---|
+| It lists other dates, not this one | `no recordings on 2026-01-09 — the device has no such date. Dates with recordings: 2026-01-03, 2026-01-04` |
+| It lists this date, and no files in it | `no recordings on 2026-01-04 — the device does list 2026-01-04 as a date it has, but served no files for it.` |
+| It lists no dates at all | `no recordings on 2026-01-04 — and none anywhere on this device: APP&LIST_DIRS listed no dates at all.` |
+
+`PocketSession`/`PocketDevice.lookUpRecordings(forDate:)` is the same rule for
+API callers, returning `RecordingLookup.found` / `.refused` / `.empty`.
+`listRecordings(on:)` stays unvalidated on purpose — it also takes directories
+that came *from* the device, and those are not always dates (hardware has
+produced IDs like `PH260105143000`).
 
 ### `sync-wifi` — the reuse experiment
 
